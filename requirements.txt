@@ -1,0 +1,19 @@
+# ==========================
+# Data Processing
+# ==========================
+pandas==2.2.2
+numpy==1.26.4
+
+# ==========================
+# Machine Learning
+# ==========================
+scikit-learn==1.5.0
+scipy==1.13.1
+joblib==1.4.2
+threadpoolctl==3.5.0
+
+# ==========================
+# Database (Supabase - PostgreSQL)
+# ==========================
+SQLAlchemy==2.0.46
+psycopg2-binary==2.9.11

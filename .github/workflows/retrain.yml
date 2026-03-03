@@ -1,0 +1,52 @@
+name: Daily Assistant Retraining
+
+on:
+  schedule:
+    - cron: '0 0 * * *'   # 5:30 AM IST
+  workflow_dispatch:
+
+jobs:
+  retrain:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout ML Repo
+        uses: actions/checkout@v3
+
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: 3.11
+
+      - name: Install Dependencies
+        run: pip install -r requirements.txt
+
+      - name: Train Model
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: python train.py
+
+      - name: Check if model exists
+        id: check_model
+        run: |
+          if [ -f "models/assistant_intent_model.pkl" ]; then
+            echo "model_exists=true" >> $GITHUB_OUTPUT
+          else
+            echo "model_exists=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Push model to assistant-service
+        if: steps.check_model.outputs.model_exists == 'true'
+        env:
+          TOKEN: ${{ secrets.ASSISTANT_REPO_TOKEN }}
+          REPO: ${{ secrets.ASSISTANT_REPO_NAME }}
+        run: |
+          git clone https://x-access-token:${TOKEN}@github.com/${REPO}.git target_repo
+          mkdir -p target_repo/models
+          cp models/assistant_intent_model.pkl target_repo/models/
+          cd target_repo
+          git config user.name "ML Bot"
+          git config user.email "ml-bot@example.com"
+          git add models/assistant_intent_model.pkl
+          git commit -m "🔄 Daily model update"
+          git push
