@@ -1,4 +1,4 @@
-name: 🧠 Daily Assistant Retraining + Email
+name: 🧠 Daily Assistant Retraining + Email Report
 
 on:
   schedule:
@@ -10,8 +10,9 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
+
       # ==========================================
-      # 1️⃣ Checkout ML Repository
+      # 1️⃣ Checkout Repository
       # ==========================================
       - name: 📥 Checkout ML Repo
         uses: actions/checkout@v3
@@ -19,7 +20,7 @@ jobs:
       # ==========================================
       # 2️⃣ Setup Python
       # ==========================================
-      - name: 🐍 Setup Python 3.11
+      - name: 🐍 Setup Python
         uses: actions/setup-python@v4
         with:
           python-version: 3.11
@@ -29,42 +30,42 @@ jobs:
       # ==========================================
       - name: 📦 Install Dependencies
         run: |
-          echo "Installing Python dependencies..."
+          echo "Installing dependencies..."
           pip install -r requirements.txt
-          echo "Dependencies installed successfully."
+          echo "Dependencies installed."
 
       # ==========================================
       # 4️⃣ Train Model
       # ==========================================
-      - name: 🚀 Train Assistant Model
+      - name: 🚀 Train Model
         id: train_step
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
         run: |
-          echo "=============================="
-          echo "🚀 STARTING MODEL TRAINING"
-          echo "=============================="
+          echo "======================================"
+          echo "🚀 STARTING ASSISTANT MODEL TRAINING"
+          echo "======================================"
           python train.py
-          echo "=============================="
-          echo "✅ TRAINING SCRIPT FINISHED"
-          echo "=============================="
+          echo "======================================"
+          echo "✅ TRAINING COMPLETED"
+          echo "======================================"
 
       # ==========================================
-      # 5️⃣ Check If Model Was Created
+      # 5️⃣ Check Model File
       # ==========================================
-      - name: 🔎 Check Model File
+      - name: 🔍 Check Model File
         id: check_model
         run: |
           if [ -f "models/assistant_intent_model.pkl" ]; then
             echo "model_exists=true" >> $GITHUB_OUTPUT
-            echo "✅ Model file found."
+            echo "Model file exists."
           else
             echo "model_exists=false" >> $GITHUB_OUTPUT
-            echo "❌ Model file NOT found."
+            echo "Model file NOT found."
           fi
 
       # ==========================================
-      # 6️⃣ Push Model To assistant-service Repo
+      # 6️⃣ Push Model To Assistant Service
       # ==========================================
       - name: 📤 Push Model To Assistant Service
         if: steps.check_model.outputs.model_exists == 'true'
@@ -72,7 +73,7 @@ jobs:
           TOKEN: ${{ secrets.ASSISTANT_REPO_TOKEN }}
           REPO: ${{ secrets.ASSISTANT_REPO_NAME }}
         run: |
-          echo "Cloning assistant-service repository..."
+          echo "Cloning assistant-service repo..."
           git clone https://x-access-token:${TOKEN}@github.com/${REPO}.git target_repo
 
           mkdir -p target_repo/models
@@ -86,12 +87,21 @@ jobs:
           git commit -m "🔄 Daily model update"
           git push
 
-          echo "✅ Model pushed successfully to assistant-service."
+          echo "Model pushed successfully."
 
       # ==========================================
-      # 7️⃣ Send Email Notification
+      # 7️⃣ Generate Date (DD-MM-YYYY)
       # ==========================================
-      - name: 📧 Send Email Notification
+      - name: 📅 Generate Date
+        id: date_step
+        run: |
+          TODAY=$(date +"%d-%m-%Y")
+          echo "today_date=$TODAY" >> $GITHUB_OUTPUT
+
+      # ==========================================
+      # 8️⃣ Send Email Report
+      # ==========================================
+      - name: 📧 Send Email Report
         if: always()
         uses: dawidd6/action-send-mail@v3
         with:
@@ -99,20 +109,45 @@ jobs:
           server_port: 465
           username: ${{ secrets.MAIL_USERNAME }}
           password: ${{ secrets.MAIL_PASSWORD }}
-          subject: "🧠 Assistant ML Pipeline - Training Report"
+          subject: "🧠 Assistant ML Training Report - ${{ steps.date_step.outputs.today_date }}"
           to: ${{ secrets.MAIL_TO }}
           cc: ${{ secrets.MAIL_CC }}
-          from: "Assistant ML Bot"
+          from: Assistant ML Bot
           secure: true
-          body: |
-            🧠 Assistant ML Pipeline Execution Report
+          html_body: |
+            <h2>🧠 Assistant ML Pipeline Report</h2>
 
-            Repository: assistant-ml-pipeline
-            Date: ${{ github.run_id }}
+            <table border="1" cellpadding="8" cellspacing="0">
+              <tr>
+                <th align="left">Execution Date</th>
+                <td>${{ steps.date_step.outputs.today_date }}</td>
+              </tr>
+              <tr>
+                <th align="left">Repository</th>
+                <td>${{ github.repository }}</td>
+              </tr>
+              <tr>
+                <th align="left">Run ID</th>
+                <td>${{ github.run_id }}</td>
+              </tr>
+              <tr>
+                <th align="left">Model File Created</th>
+                <td>${{ steps.check_model.outputs.model_exists }}</td>
+              </tr>
+              <tr>
+                <th align="left">Workflow Status</th>
+                <td>${{ job.status }}</td>
+              </tr>
+            </table>
 
-            Model File Created: ${{ steps.check_model.outputs.model_exists }}
+            <br>
 
-            Check GitHub Actions for full logs:
-            ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+            <p>
+              🔎 View Full Logs:<br>
+              <a href="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}">
+                Open GitHub Actions Run
+              </a>
+            </p>
 
-            🚀 System running with automated retraining.
+            <br>
+            <p>🚀 Automated ML retraining system is running successfully.</p>
