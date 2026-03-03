@@ -1,4 +1,4 @@
-name: 🧠 Assistant ML Retraining + Dynamic Report
+name: 🧠 Assistant ML Retraining + Dynamic Report    
 
 on:
   # 1️⃣ Daily Scheduled Run (5:30 AM IST)
