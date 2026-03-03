@@ -1,4 +1,4 @@
-name: Daily Assistant Retraining
+name: 🧠 Daily Assistant Retraining + Email
 
 on:
   schedule:
@@ -10,43 +10,109 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout ML Repo
+      # ==========================================
+      # 1️⃣ Checkout ML Repository
+      # ==========================================
+      - name: 📥 Checkout ML Repo
         uses: actions/checkout@v3
 
-      - name: Setup Python
+      # ==========================================
+      # 2️⃣ Setup Python
+      # ==========================================
+      - name: 🐍 Setup Python 3.11
         uses: actions/setup-python@v4
         with:
           python-version: 3.11
 
-      - name: Install Dependencies
-        run: pip install -r requirements.txt
+      # ==========================================
+      # 3️⃣ Install Dependencies
+      # ==========================================
+      - name: 📦 Install Dependencies
+        run: |
+          echo "Installing Python dependencies..."
+          pip install -r requirements.txt
+          echo "Dependencies installed successfully."
 
-      - name: Train Model
+      # ==========================================
+      # 4️⃣ Train Model
+      # ==========================================
+      - name: 🚀 Train Assistant Model
+        id: train_step
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
-        run: python train.py
+        run: |
+          echo "=============================="
+          echo "🚀 STARTING MODEL TRAINING"
+          echo "=============================="
+          python train.py
+          echo "=============================="
+          echo "✅ TRAINING SCRIPT FINISHED"
+          echo "=============================="
 
-      - name: Check if model exists
+      # ==========================================
+      # 5️⃣ Check If Model Was Created
+      # ==========================================
+      - name: 🔎 Check Model File
         id: check_model
         run: |
           if [ -f "models/assistant_intent_model.pkl" ]; then
             echo "model_exists=true" >> $GITHUB_OUTPUT
+            echo "✅ Model file found."
           else
             echo "model_exists=false" >> $GITHUB_OUTPUT
+            echo "❌ Model file NOT found."
           fi
 
-      - name: Push model to assistant-service
+      # ==========================================
+      # 6️⃣ Push Model To assistant-service Repo
+      # ==========================================
+      - name: 📤 Push Model To Assistant Service
         if: steps.check_model.outputs.model_exists == 'true'
         env:
           TOKEN: ${{ secrets.ASSISTANT_REPO_TOKEN }}
           REPO: ${{ secrets.ASSISTANT_REPO_NAME }}
         run: |
+          echo "Cloning assistant-service repository..."
           git clone https://x-access-token:${TOKEN}@github.com/${REPO}.git target_repo
+
           mkdir -p target_repo/models
           cp models/assistant_intent_model.pkl target_repo/models/
+
           cd target_repo
           git config user.name "ML Bot"
           git config user.email "ml-bot@example.com"
+
           git add models/assistant_intent_model.pkl
           git commit -m "🔄 Daily model update"
           git push
+
+          echo "✅ Model pushed successfully to assistant-service."
+
+      # ==========================================
+      # 7️⃣ Send Email Notification
+      # ==========================================
+      - name: 📧 Send Email Notification
+        if: always()
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: smtp.gmail.com
+          server_port: 465
+          username: ${{ secrets.MAIL_USERNAME }}
+          password: ${{ secrets.MAIL_PASSWORD }}
+          subject: "🧠 Assistant ML Pipeline - Training Report"
+          to: ${{ secrets.MAIL_TO }}
+          cc: ${{ secrets.MAIL_CC }}
+          from: "Assistant ML Bot"
+          secure: true
+          body: |
+            🧠 Assistant ML Pipeline Execution Report
+
+            Repository: assistant-ml-pipeline
+            Date: ${{ github.run_id }}
+
+            Model File Created: ${{ steps.check_model.outputs.model_exists }}
+
+            Check GitHub Actions for full logs:
+            ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+            🚀 System running with automated retraining.
