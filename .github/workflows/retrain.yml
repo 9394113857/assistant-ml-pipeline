@@ -1,6 +1,6 @@
 name: 🧠 Assistant ML Retraining + Dynamic Report    
 
-on:
+on: 
   # 1️⃣ Daily Scheduled Run (5:30 AM IST)  
   schedule:
     - cron: '0 0 * * *'
