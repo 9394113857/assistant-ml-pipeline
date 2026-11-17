@@ -1,346 +1,399 @@
 
 import os
 import sys
+import math
 import pandas as pd
 import joblib
 
-# SQLAlchemy is used to connect Python with PostgreSQL / Supabase.
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, text
 
-# Machine Learning libraries
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.linear_model import LogisticRegression
 from sklearn.pipeline import Pipeline
-
-# Used to divide the dataset into training and testing data.
 from sklearn.model_selection import train_test_split
-
-# Used to evaluate how accurately our model predicts intents.
-from sklearn.metrics import accuracy_score
+from sklearn.metrics import accuracy_score, classification_report
 
 
 # ==========================================================
 # ASSISTANT ML PIPELINE
 # ==========================================================
 #
-# Overall workflow:
+# PURPOSE:
+# Automatically train the Assistant intent classification
+# model using records stored in Supabase PostgreSQL.
 #
-# 1. Read DATABASE_URL from GitHub Actions environment.
-# 2. Connect to our shared Assistant Supabase database.
-# 3. Fetch messages and their corresponding intents.
-# 4. Validate and clean the training data.
-# 5. Split data into training and testing datasets.
-# 6. Train the ML model using TF-IDF + Logistic Regression.
-# 7. Evaluate model accuracy.
-# 8. Save the trained model as a .pkl file.
+# DATABASE TABLE:
+# public.assistant_training_logs
+#
+# INPUT:
+# user_message
+#
+# TARGET:
+# predicted_intent
+#
+# MODEL:
+# TF-IDF + Logistic Regression
+#
+# OUTPUT:
+# models/assistant_intent_model.pkl
+#
+# IMPORTANT:
+# We currently train using predicted_intent because
+# actual_intent is NULL in the records inspected so far.
+# These are predicted labels, not human-verified labels.
 #
 # ==========================================================
 
-print("\n🚀 Starting Assistant Model Training...")
+
+# ==========================================================
+# CONFIGURATION
+# ==========================================================
+
+MINIMUM_RECORDS = 20
+
+MINIMUM_ACCURACY = 0.70
+
+MODEL_PATH = "models/assistant_intent_model.pkl"
+
+TABLE_NAME = "public.assistant_training_logs"
 
 
 # ==========================================================
-# STEP 1: LOAD DATABASE CONNECTION URL
+# HELPER FUNCTION: STOP TRAINING WITH A CLEAR STATUS
 # ==========================================================
 
-# DATABASE_URL is configured in GitHub repository secrets.
-#
-# GitHub Actions passes this secret to Python as an
-# environment variable.
-#
-# We do not hardcode the database password in this file.
-#
-# Example format:
-# postgresql://username:password@host:5432/database
+def stop_training(message, status="NOT_TRAINED"):
 
-DATABASE_URL = os.getenv("DATABASE_URL")
+    print("\n" + "=" * 55)
+    print(f"❌ TRAINING STATUS: {status}")
+    print(f"REASON: {message}")
+    print("=" * 55)
 
+    # A non-zero exit code tells GitHub Actions
+    # that the training step failed or did not produce
+    # a deployable model.
+    #
+    # The workflow will still attempt to send an email
+    # because its email step uses if: always().
 
-# Check whether DATABASE_URL exists.
-# Without it, Python cannot connect to Supabase.
-
-if not DATABASE_URL:
-
-    print("❌ DATABASE_URL is not configured.")
-
-    # Exit code 1 means failure.
     sys.exit(1)
 
 
-print("✅ DATABASE_URL found.")
+# ==========================================================
+# STEP 1: START TRAINING
+# ==========================================================
+
+print("\n" + "=" * 55)
+print("🚀 ASSISTANT ML MODEL TRAINING")
+print("=" * 55)
+
+print("\n📌 Training configuration")
+print(f"Minimum records : {MINIMUM_RECORDS}")
+print(f"Minimum accuracy: {MINIMUM_ACCURACY * 100:.0f}%")
+print(f"Database table  : {TABLE_NAME}")
+print(f"Model output    : {MODEL_PATH}")
 
 
 # ==========================================================
-# STEP 2: CONNECT TO SUPABASE POSTGRESQL
+# STEP 2: LOAD DATABASE URL
+# ==========================================================
+
+# DATABASE_URL is stored in GitHub Actions Secrets.
+#
+# Never hardcode the database password here.
+# Never print the complete DATABASE_URL in GitHub logs.
+
+DATABASE_URL = os.getenv("DATABASE_URL")
+
+if not DATABASE_URL:
+
+    stop_training(
+        "DATABASE_URL secret is missing."
+    )
+
+print("\n✅ DATABASE_URL environment variable found.")
+
+
+# ==========================================================
+# STEP 3: CONNECT TO SUPABASE
 # ==========================================================
 
 try:
 
-    # create_engine() prepares a SQLAlchemy database engine.
-    # This engine will be used to execute SQL queries.
+    engine = create_engine(
+        DATABASE_URL,
+        pool_pre_ping=True
+    )
 
-    engine = create_engine(DATABASE_URL)
+    # Test the connection and inspect the database context.
+    # This diagnostic query helps compare GitHub Actions
+    # with the Supabase SQL Editor.
 
-    # Actually test the database connection.
-    # Creating an engine alone does not guarantee
-    # that the database is reachable.
+    diagnostic_query = text("""
+        SELECT
+            current_database() AS database_name,
+            current_user AS database_user,
+            current_schema() AS current_schema,
+            (
+                SELECT COUNT(*)
+                FROM public.assistant_training_logs
+            ) AS training_records
+    """)
 
-    with engine.connect():
+    with engine.connect() as connection:
 
-        print("✅ Successfully connected to Supabase PostgreSQL.")
+        result = connection.execute(diagnostic_query)
+
+        row = result.fetchone()
+
+    print("\n🔍 DATABASE DIAGNOSTICS")
+    print("-" * 40)
+
+    print(f"Database          : {row.database_name}")
+    print(f"Database user     : {row.database_user}")
+    print(f"Current schema    : {row.current_schema}")
+    print(f"Database row count: {row.training_records}")
+
+    print("-" * 40)
+
+    print("✅ Supabase connection successful.")
 
 except Exception as e:
 
-    print("❌ Database connection failed.")
-    print(f"Error details: {e}")
+    stop_training(
+        f"Database connection or diagnostic query failed: {e}"
+    )
 
-    sys.exit(1)
+finally:
+
+    # If connection creation succeeded, close the engine
+    # after fetching the data.
+    #
+    # The engine may not exist if create_engine itself failed.
+
+    if "engine" in locals():
+        engine.dispose()
 
 
 # ==========================================================
-# STEP 3: FETCH TRAINING DATA FROM DATABASE
+# STEP 4: FETCH TRAINING DATA
 # ==========================================================
 
-# We are reading two columns from our existing table:
-#
-# assistant_training_logs
+# We fetch only the columns currently used by our model.
 #
 # user_message:
-#     The original message entered by the user.
+#   The original message entered by the user.
 #
 # predicted_intent:
-#     The intent currently stored for that message.
+#   The intent assigned by the current Assistant system.
 #
-# Example:
-#
-# user_message                  predicted_intent
-# ------------------------------------------------
-# Hello                         greeting
-# Show my orders                order_status
-# I want to buy a product       product_search
-#
-# IMPORTANT:
-# At this stage, we are using predicted_intent as the
-# training target because that is what your current
-# database schema and code provide.
-#
-# Later, we should verify whether these are human-verified
-# labels or predictions from the existing model.
+# We exclude NULL and empty messages.
 
 query = """
 SELECT
     user_message,
     predicted_intent
-FROM assistant_training_logs
+FROM public.assistant_training_logs
 WHERE predicted_intent IS NOT NULL
   AND user_message IS NOT NULL
   AND TRIM(user_message) <> ''
+ORDER BY id ASC
 """
 
 
 try:
 
-    # Execute the SQL query and load its results into
-    # a Pandas DataFrame.
-    #
-    # A DataFrame is a table-like structure in Python.
+    # Re-create the engine because the diagnostic engine
+    # was disposed after its connection test.
 
-    df = pd.read_sql(query, engine)
+    engine = create_engine(
+        DATABASE_URL,
+        pool_pre_ping=True
+    )
 
-    print("✅ Training data fetched successfully.")
+    df = pd.read_sql(
+        query,
+        engine
+    )
 
 except Exception as e:
 
-    print("❌ Failed to fetch training data from database.")
-    print(f"Error details: {e}")
-
-    sys.exit(1)
+    stop_training(
+        f"Failed to fetch records from {TABLE_NAME}: {e}"
+    )
 
 finally:
 
-    # Close the database engine connections after fetching.
-    engine.dispose()
+    if "engine" in locals():
+        engine.dispose()
 
 
-# Display how many records were retrieved.
+print("\n📊 DATABASE FETCH REPORT")
+print("-" * 40)
 
-print(f"\n📊 Total training rows fetched: {len(df)}")
+print(f"Total training rows fetched: {len(df)}")
+
+print("-" * 40)
 
 
 # ==========================================================
-# STEP 4: VALIDATE AND CLEAN TRAINING DATA
+# STEP 5: CLEAN TRAINING DATA
 # ==========================================================
 
-# First, check whether we have enough records.
-#
-# Your current minimum requirement is 20 records.
-#
-# If the database returns only 2 records,
-# the training process must stop.
-
-MINIMUM_RECORDS = 20
-
-if len(df) < MINIMUM_RECORDS:
-
-    print(
-        f"❌ Not enough training data. "
-        f"Required: {MINIMUM_RECORDS}, Available: {len(df)}"
-    )
-
-    # Exit code 1 tells GitHub Actions that training failed.
-    # Previously you used sys.exit(0), which incorrectly
-    # reported successful execution.
-
-    sys.exit(1)
-
-
-# Remove duplicate message + intent combinations.
-#
-# Example:
-# "Hello" + "greeting"
-# "Hello" + "greeting"
-#
-# Only one identical combination is retained.
-
-df = df.drop_duplicates(
-    subset=["user_message", "predicted_intent"]
-)
-
-
-# Remove any remaining missing values.
+# Remove missing values.
 
 df = df.dropna(
     subset=["user_message", "predicted_intent"]
 )
 
-
-# Convert message and intent values into strings.
-# This ensures the text-processing pipeline receives text.
+# Convert values to text.
 
 df["user_message"] = df["user_message"].astype(str)
+
 df["predicted_intent"] = df["predicted_intent"].astype(str)
 
-
-# Remove empty messages and surrounding spaces.
+# Remove leading and trailing spaces.
 
 df["user_message"] = df["user_message"].str.strip()
 
-df = df[df["user_message"] != ""]
+df["predicted_intent"] = df["predicted_intent"].str.strip()
+
+# Remove empty messages and empty intent labels.
+
+df = df[
+    (df["user_message"] != "") &
+    (df["predicted_intent"] != "")
+]
+
+# Remove duplicate message + intent combinations.
+#
+# Example:
+# hi + greeting
+# hi + greeting
+#
+# Only one identical combination remains.
+#
+# NOTE:
+# The same message with DIFFERENT intents is retained.
+# Such conflicting labels need investigation.
+
+df = df.drop_duplicates(
+    subset=["user_message", "predicted_intent"]
+).reset_index(drop=True)
 
 
-print(f"📊 Training rows after cleaning: {len(df)}")
+print("\n🧹 DATA CLEANING REPORT")
+print("-" * 40)
+
+print(f"Valid unique rows: {len(df)}")
+
+print("-" * 40)
 
 
-# Check the minimum requirement again after cleaning.
+# ==========================================================
+# STEP 6: CHECK MINIMUM RECORD COUNT
+# ==========================================================
 
 if len(df) < MINIMUM_RECORDS:
 
-    print("❌ Not enough unique and valid records after cleaning.")
-
-    sys.exit(1)
+    stop_training(
+        f"Insufficient training data. "
+        f"Required: {MINIMUM_RECORDS}, "
+        f"Available after cleaning: {len(df)}."
+    )
 
 
 # ==========================================================
-# STEP 5: CHECK INTENT DISTRIBUTION
+# STEP 7: CHECK INTENT DISTRIBUTION
 # ==========================================================
-
-# An intent is the category of a user's message.
-#
-# Example:
-#
-# greeting       = Hello, Hi, Good morning
-# order_status   = Where is my order?
-# product_search = Show me available products
-# contact_support = I need help
-#
-# We need at least two different intent categories
-# to train a classification model.
 
 intent_counts = df["predicted_intent"].value_counts()
 
+number_of_intents = len(intent_counts)
 
-print("\n📊 Intent Distribution:")
+print("\n📊 INTENT DISTRIBUTION")
+print("-" * 40)
+
 print(intent_counts.to_string())
 
+print("-" * 40)
 
-# Count the number of unique intent categories.
+print(f"Unique intent categories: {number_of_intents}")
 
-number_of_intents = df["predicted_intent"].nunique()
 
+# At least two intent classes are required
+# for a classification model.
 
 if number_of_intents < 2:
 
-    print("❌ At least 2 different intent classes are required.")
+    stop_training(
+        "At least two different intent categories are required."
+    )
 
-    sys.exit(1)
 
-
-# Each intent must have at least 2 records.
-#
-# We use stratified splitting below.
-# This requires enough examples of every class
-# to distribute them across training and testing datasets.
+# Every intent needs at least two examples for
+# stratified train/test splitting.
 
 if intent_counts.min() < 2:
 
-    print(
-        "❌ Each intent must have at least 2 records "
-        "before train/test splitting."
+    stop_training(
+        "Every intent category needs at least two examples."
     )
 
-    sys.exit(1)
 
+# Check that the 20% testing dataset can contain
+# at least one example of every intent category.
 
-print("✅ Intent distribution validation completed.")
+test_record_count = math.ceil(len(df) * 0.20)
+
+train_record_count = len(df) - test_record_count
+
+if test_record_count < number_of_intents:
+
+    stop_training(
+        "Not enough testing records to represent every intent."
+    )
+
+if train_record_count < number_of_intents:
+
+    stop_training(
+        "Not enough training records to represent every intent."
+    )
 
 
 # ==========================================================
-# STEP 6: SEPARATE INPUT (X) AND OUTPUT (y)
+# STEP 8: PREPARE INPUT X AND TARGET y
 # ==========================================================
 
-# X = Input messages.
+# X = User messages.
 #
-# These are the messages the model learns from.
-#
-# y = Expected intent labels.
-#
-# The model learns the relationship between X and y.
+# y = Predicted intent labels.
 #
 # Example:
 #
-# X                              y
-# -------------------------------------------
-# Hello                          greeting
-# Show my orders                 order_status
-# Find a mobile phone            product_search
+# X                         y
+# --------------------------------
+# hi                        greeting
+# hello                     greeting
+# show products list        show_products
+# recommend one             recommend_product
 
 X = df["user_message"]
 
 y = df["predicted_intent"]
 
-
-print("\n✅ Input messages (X) and intent labels (y) prepared.")
+print("\n✅ INPUT AND TARGET DATA PREPARED.")
 
 
 # ==========================================================
-# STEP 7: SPLIT TRAINING AND TESTING DATA
+# STEP 9: TRAIN / TEST SPLIT
 # ==========================================================
 
-# We divide the dataset into:
+# 80% of records are used for training.
+# 20% of records are used for evaluation.
 #
-# 80% Training data:
-#     Used by the model to learn patterns.
-#
-# 20% Testing data:
-#     Used to evaluate the model on messages it did not
-#     receive during training.
-#
-# random_state=42:
-#     Makes the split reproducible.
-#
-# stratify=y:
-#     Preserves the approximate distribution of each
-#     intent category in both datasets.
+# stratify=y preserves the intent distribution
+# as far as possible in both datasets.
 
 try:
 
@@ -357,52 +410,39 @@ try:
 
     )
 
-except ValueError as e:
+except Exception as e:
 
-    print("❌ Failed to split training and testing data.")
-    print(f"Error details: {e}")
+    stop_training(
+        f"Train/test split failed: {e}"
+    )
 
-    sys.exit(1)
 
+print("\n📚 DATASET SPLIT")
+print("-" * 40)
 
-print(f"\n📚 Training records: {len(X_train)}")
-print(f"🧪 Testing records: {len(X_test)}")
+print(f"Training records: {len(X_train)}")
+
+print(f"Testing records : {len(X_test)}")
+
+print("-" * 40)
 
 
 # ==========================================================
-# STEP 8: BUILD THE MACHINE LEARNING PIPELINE
+# STEP 10: CREATE ML PIPELINE
 # ==========================================================
 
-# Our model contains two stages:
-#
-# 1. TF-IDF Vectorizer
-# 2. Logistic Regression Classifier
-#
-# ----------------------------------------------------------
 # TF-IDF:
-#
 # Converts text messages into numerical features.
 #
-# Machine learning algorithms cannot directly understand
-# raw text such as:
-#
-# "Hello, how are you?"
-#
-# TF-IDF converts words into numerical representations
-# based on their importance in the dataset.
-#
-# ----------------------------------------------------------
 # Logistic Regression:
+# Learns patterns from those features and predicts
+# the appropriate intent category.
 #
-# This is our classification algorithm.
+# Pipeline:
+# Combines both steps into one reusable ML model.
 #
-# It learns patterns from the numerical features and
-# predicts the most likely intent category.
-#
-# max_iter=1000:
-# Allows the algorithm more iterations to converge.
-#
-# ----------------------------------------------------------
+# Saving this pipeline allows Flask to load both
+# the vectorizer and classifier together.
 
 model = Pipeline([
 
@@ -412,69 +452,47 @@ model = Pipeline([
     ),
 
     (
-        "clf",
-        LogisticRegression(max_iter=1000)
+        "classifier",
+        LogisticRegression(
+            max_iter=1000
+        )
     )
 
 ])
 
 
-print("\n🧠 ML Pipeline created successfully.")
+print("\n🧠 ML PIPELINE CREATED.")
 
 
 # ==========================================================
-# STEP 9: TRAIN THE MODEL
+# STEP 11: TRAIN THE MODEL
 # ==========================================================
-
-# model.fit():
-#
-# This is where the actual learning happens.
-#
-# The model receives:
-#
-# X_train = User messages
-# y_train = Corresponding intent labels
-#
-# It learns how different words and phrases relate
-# to the intent categories.
 
 try:
 
-    print("\n🚀 Model training started...")
+    print("\n🚀 MODEL TRAINING STARTED...")
 
-    model.fit(X_train, y_train)
+    model.fit(
+        X_train,
+        y_train
+    )
 
-    print("✅ Model training completed.")
+    print("✅ MODEL TRAINING COMPLETED.")
 
 except Exception as e:
 
-    print("❌ Model training failed.")
-    print(f"Error details: {e}")
-
-    sys.exit(1)
+    stop_training(
+        f"Model fitting failed: {e}"
+    )
 
 
 # ==========================================================
-# STEP 10: EVALUATE THE TRAINED MODEL
+# STEP 12: EVALUATE MODEL
 # ==========================================================
-
-# Now we test the model using X_test.
-#
-# These messages were not used during training.
-#
-# model.predict():
-# Predicts the intent for each testing message.
-#
-# accuracy_score():
-# Compares predicted intents with actual test labels.
-#
-# Formula:
-#
-# Accuracy = Correct Predictions / Total Predictions
 
 try:
 
-    print("\n🔍 Evaluating model...")
+    print("\n🔍 MODEL EVALUATION STARTED...")
 
     predictions = model.predict(X_test)
 
@@ -483,105 +501,95 @@ try:
         predictions
     )
 
-    print(f"📊 Model Accuracy: {accuracy:.4f}")
+    print(f"\n📊 MODEL ACCURACY: {accuracy:.4f}")
+
+    print("\n📋 CLASSIFICATION REPORT")
+
+    print(
+        classification_report(
+            y_test,
+            predictions,
+            zero_division=0
+        )
+    )
 
 except Exception as e:
 
-    print("❌ Model evaluation failed.")
-    print(f"Error details: {e}")
-
-    sys.exit(1)
+    stop_training(
+        f"Model evaluation failed: {e}"
+    )
 
 
 # ==========================================================
-# STEP 11: CHECK MODEL ACCURACY
+# STEP 13: CHECK ACCURACY THRESHOLD
 # ==========================================================
-
-# We currently require at least 70% accuracy.
-#
-# If accuracy is below 70%, we do not save this model.
-#
-# IMPORTANT:
-# Accuracy alone does not guarantee a good classifier.
-# We should later inspect precision, recall and F1-score.
-
-MINIMUM_ACCURACY = 0.70
 
 if accuracy < MINIMUM_ACCURACY:
 
-    print(
-        f"❌ Accuracy is below the required "
-        f"{MINIMUM_ACCURACY * 100:.0f}%."
+    stop_training(
+        f"Model accuracy {accuracy:.4f} is below "
+        f"the required {MINIMUM_ACCURACY:.2f}. "
+        "Model will not be saved."
     )
 
-    print("❌ Model will NOT be saved.")
 
-    sys.exit(1)
-
-
-print("✅ Model passed the accuracy threshold.")
+print("\n✅ MODEL PASSED ACCURACY VALIDATION.")
 
 
 # ==========================================================
-# STEP 12: SAVE THE TRAINED MODEL
+# STEP 14: SAVE TRAINED MODEL
 # ==========================================================
-
-# Create the models folder if it does not exist.
-#
-# exist_ok=True means Python will not raise an error
-# if the folder already exists.
 
 try:
+
+    # Create the output folder if necessary.
 
     os.makedirs(
         "models",
         exist_ok=True
     )
 
-
-    # This is the model file path.
-    #
-    # Keep this path consistent with the path used by
-    # your Flask assistant-service when loading the model.
-
-    model_path = "models/assistant_intent_model.pkl"
-
-
-    # joblib.dump():
-    #
-    # Saves the complete trained ML pipeline.
-    #
-    # This includes:
-    # - TF-IDF Vectorizer
-    # - Logistic Regression Classifier
-    #
-    # Flask can later load this file using joblib.load().
+    # Save the complete trained pipeline.
 
     joblib.dump(
         model,
-        model_path
+        MODEL_PATH
     )
 
+    # Verify that the file exists and is not empty.
 
-    print(f"🎉 Model saved successfully: {model_path}")
+    if not os.path.exists(MODEL_PATH):
+
+        stop_training(
+            "Model file was not created."
+        )
+
+    if os.path.getsize(MODEL_PATH) == 0:
+
+        stop_training(
+            "Model file is empty."
+        )
+
+    print(f"\n🎉 MODEL SAVED: {MODEL_PATH}")
 
 except Exception as e:
 
-    print("❌ Failed to save model.")
-    print(f"Error details: {e}")
-
-    sys.exit(1)
+    stop_training(
+        f"Model saving failed: {e}"
+    )
 
 
 # ==========================================================
-# STEP 13: FINAL TRAINING SUMMARY
+# STEP 15: FINAL TRAINING REPORT
 # ==========================================================
 
-print("\n========================================")
+print("\n" + "=" * 55)
+
 print("       ASSISTANT ML TRAINING REPORT")
-print("========================================")
 
-print(f"Total records fetched : {len(df)}")
+print("=" * 55)
+
+print(f"Training rows fetched : {len(df)}")
 
 print(f"Training records      : {len(X_train)}")
 
@@ -591,13 +599,27 @@ print(f"Intent categories     : {number_of_intents}")
 
 print(f"Model accuracy        : {accuracy:.4f}")
 
-print(f"Model saved           : YES")
+print(f"Accuracy threshold    : {MINIMUM_ACCURACY:.2f}")
 
-print(f"Model location        : {model_path}")
+print("Model saved           : YES")
 
-print("========================================")
+print(f"Model location        : {MODEL_PATH}")
 
-print("\n🎉 ASSISTANT MODEL TRAINING COMPLETED SUCCESSFULLY!")
+print("=" * 55)
 
-# Exit code 0 means everything completed successfully.
+# These markers are read by GitHub Actions
+# to construct the final email report.
+
+print("TRAINING_STATUS=TRAINED")
+
+print("MODEL_SAVED=true")
+
+print(f"MODEL_ACCURACY={accuracy:.4f}")
+
+print(f"TRAINING_ROWS={len(df)}")
+
+print("MODEL_PATH=models/assistant_intent_model.pkl")
+
+print("\n🎉 ASSISTANT ML TRAINING COMPLETED SUCCESSFULLY!")
+
 sys.exit(0)
