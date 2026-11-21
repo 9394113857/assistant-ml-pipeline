@@ -29,7 +29,7 @@ from sklearn.metrics import accuracy_score, classification_report
 # user_message
 #
 # TARGET:
-# predicted_intent
+# actual_intent when human-corrected, otherwise predicted_intent.
 #
 # MODEL:
 # TF-IDF + Logistic Regression
@@ -38,9 +38,9 @@ from sklearn.metrics import accuracy_score, classification_report
 # models/assistant_intent_model.pkl
 #
 # IMPORTANT:
-# We currently train using predicted_intent because
-# actual_intent is NULL in the records inspected so far.
-# These are predicted labels, not human-verified labels.
+# Human-corrected actual_intent labels take priority.
+# When actual_intent is NULL or blank, predicted_intent
+# remains the fallback training label.
 #
 # ==========================================================
 
@@ -179,7 +179,7 @@ finally:
 # STEP 4: FETCH TRAINING DATA
 # ==========================================================
 
-# We fetch only the columns currently used by our model.
+# Fetch both original and human-corrected intent labels.
 #
 # user_message:
 #   The original message entered by the user.
@@ -187,12 +187,17 @@ finally:
 # predicted_intent:
 #   The intent assigned by the current Assistant system.
 #
+# actual_intent:
+#   Optional human-corrected intent. When populated, it
+#   takes priority as the model's training target.
+#
 # We exclude NULL and empty messages.
 
 query = """
 SELECT
     user_message,
-    predicted_intent
+    predicted_intent,
+    actual_intent
 FROM public.assistant_training_logs
 WHERE predicted_intent IS NOT NULL
   AND user_message IS NOT NULL
@@ -252,33 +257,45 @@ df["user_message"] = df["user_message"].astype(str)
 
 df["predicted_intent"] = df["predicted_intent"].astype(str)
 
+# actual_intent is optional. Preserve missing values so
+# they can fall back to predicted_intent.
+
+df["actual_intent"] = df["actual_intent"].fillna("").astype(str)
+
 # Remove leading and trailing spaces.
 
 df["user_message"] = df["user_message"].str.strip()
 
 df["predicted_intent"] = df["predicted_intent"].str.strip()
 
-# Remove empty messages and empty intent labels.
+df["actual_intent"] = df["actual_intent"].str.strip()
+
+# Remove empty messages and empty predicted intent labels.
 
 df = df[
     (df["user_message"] != "") &
     (df["predicted_intent"] != "")
-]
+].copy()
 
-# Remove duplicate message + intent combinations.
+# Select the effective training label.
 #
-# Example:
-# hi + greeting
-# hi + greeting
+# A human-corrected actual_intent takes priority.
+# If it is NULL or blank, use predicted_intent.
 #
-# Only one identical combination remains.
+# Keep both source columns unchanged for traceability.
+
+df["training_intent"] = df["actual_intent"].where(
+    df["actual_intent"] != "",
+    df["predicted_intent"]
+)
+
+# Remove duplicate message + effective training label combinations.
 #
-# NOTE:
-# The same message with DIFFERENT intents is retained.
-# Such conflicting labels need investigation.
+# The same message with DIFFERENT effective labels is retained
+# for investigation rather than silently discarded.
 
 df = df.drop_duplicates(
-    subset=["user_message", "predicted_intent"]
+    subset=["user_message", "training_intent"]
 ).reset_index(drop=True)
 
 
@@ -307,7 +324,7 @@ if len(df) < MINIMUM_RECORDS:
 # STEP 7: CHECK INTENT DISTRIBUTION
 # ==========================================================
 
-intent_counts = df["predicted_intent"].value_counts()
+intent_counts = df["training_intent"].value_counts()
 
 number_of_intents = len(intent_counts)
 
@@ -367,7 +384,9 @@ if train_record_count < number_of_intents:
 
 # X = User messages.
 #
-# y = Predicted intent labels.
+# y = Effective intent labels:
+#     actual_intent when human-corrected,
+#     otherwise predicted_intent.
 #
 # Example:
 #
@@ -380,8 +399,13 @@ if train_record_count < number_of_intents:
 
 X = df["user_message"]
 
-y = df["predicted_intent"]
+y = df["training_intent"]
 
+corrected_rows = (df["actual_intent"] != "").sum()
+fallback_rows = len(df) - corrected_rows
+
+print(f"Human-corrected labels used: {corrected_rows}")
+print(f"Predicted-label fallbacks : {fallback_rows}")
 print("\n✅ INPUT AND TARGET DATA PREPARED.")
 
 
