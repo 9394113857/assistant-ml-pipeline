@@ -2,14 +2,15 @@
 # Data Processing
 # ==========================
 pandas==2.2.2
-numpy==2.5.5
+numpy==2.4.6
 
 # ==========================
 # Machine Learning
 # Keep these versions aligned with Assistant-Service.
+# Python 3.11 compatible dependency set.
 # ==========================
 scikit-learn==1.9.1
-scipy==1.18.1
+scipy==1.17.1
 joblib==1.6.0
 threadpoolctl==3.8.0
 
