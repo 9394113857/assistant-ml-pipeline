@@ -2,15 +2,16 @@
 # Data Processing
 # ==========================
 pandas==2.2.2
-numpy==1.26.4
+numpy==2.5.5
 
 # ==========================
 # Machine Learning
+# Keep these versions aligned with Assistant-Service.
 # ==========================
 scikit-learn==1.9.1
-scipy==1.13.1
-joblib==1.4.2
-threadpoolctl==3.5.0
+scipy==1.18.1
+joblib==1.6.0
+threadpoolctl==3.8.0
 
 # ==========================
 # Database (Supabase - PostgreSQL)
