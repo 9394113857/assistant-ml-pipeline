@@ -49,9 +49,14 @@ from sklearn.metrics import accuracy_score, classification_report
 # CONFIGURATION
 # ==========================================================
 
-MINIMUM_RECORDS = 20
+MINIMUM_RECORDS = 30
 
 MINIMUM_ACCURACY = 0.70
+
+MINIMUM_EXAMPLES_PER_INTENT = 5
+
+# Only human-verified labels are eligible for supervised training.
+# Predicted intents are model outputs, not ground-truth labels.
 
 MODEL_PATH = "models/assistant_intent_model.pkl"
 
@@ -62,12 +67,23 @@ TABLE_NAME = "public.assistant_training_logs"
 # HELPER FUNCTION: STOP TRAINING WITH A CLEAR STATUS
 # ==========================================================
 
-def stop_training(message, status="NOT_TRAINED"):
+training_rows = 0
+model_accuracy = "N/A"
+
+
+def stop_training(message, status="FAILED"):
 
     print("\n" + "=" * 55)
     print(f"❌ TRAINING STATUS: {status}")
     print(f"REASON: {message}")
     print("=" * 55)
+
+    # Always emit the workflow reporting contract, including on rejection.
+    print(f"TRAINING_STATUS={status}")
+    print(f"TRAINING_ROWS={training_rows}")
+    print(f"MODEL_ACCURACY={model_accuracy}")
+    print("MODEL_SAVED=false")
+    print(f"MODEL_PATH={MODEL_PATH}")
 
     # A non-zero exit code tells GitHub Actions
     # that the training step failed or did not produce
@@ -199,7 +215,8 @@ SELECT
     predicted_intent,
     actual_intent
 FROM public.assistant_training_logs
-WHERE predicted_intent IS NOT NULL
+WHERE actual_intent IS NOT NULL
+  AND TRIM(actual_intent) <> ''
   AND user_message IS NOT NULL
   AND TRIM(user_message) <> ''
 ORDER BY id ASC
@@ -248,19 +265,18 @@ print("-" * 40)
 # Remove missing values.
 
 df = df.dropna(
-    subset=["user_message", "predicted_intent"]
+    subset=["user_message", "actual_intent"]
 )
 
 # Convert values to text.
 
 df["user_message"] = df["user_message"].astype(str)
 
-df["predicted_intent"] = df["predicted_intent"].astype(str)
+# predicted_intent is retained only for diagnostics. It is never
+# used as a substitute for a human-verified training label.
+df["predicted_intent"] = df["predicted_intent"].fillna("").astype(str)
 
-# actual_intent is optional. Preserve missing values so
-# they can fall back to predicted_intent.
-
-df["actual_intent"] = df["actual_intent"].fillna("").astype(str)
+df["actual_intent"] = df["actual_intent"].astype(str)
 
 # Remove leading and trailing spaces.
 
@@ -270,24 +286,14 @@ df["predicted_intent"] = df["predicted_intent"].str.strip()
 
 df["actual_intent"] = df["actual_intent"].str.strip()
 
-# Remove empty messages and empty predicted intent labels.
-
+# Remove empty messages and empty human-verified labels.
 df = df[
     (df["user_message"] != "") &
-    (df["predicted_intent"] != "")
+    (df["actual_intent"] != "")
 ].copy()
 
-# Select the effective training label.
-#
-# A human-corrected actual_intent takes priority.
-# If it is NULL or blank, use predicted_intent.
-#
-# Keep both source columns unchanged for traceability.
-
-df["training_intent"] = df["actual_intent"].where(
-    df["actual_intent"] != "",
-    df["predicted_intent"]
-)
+# The target is exclusively the human-verified actual_intent.
+df["training_intent"] = df["actual_intent"]
 
 # Remove duplicate message + effective training label combinations.
 #
@@ -302,7 +308,9 @@ df = df.drop_duplicates(
 print("\n🧹 DATA CLEANING REPORT")
 print("-" * 40)
 
-print(f"Valid unique rows: {len(df)}")
+training_rows = len(df)
+
+print(f"Valid unique human-verified rows: {training_rows}")
 
 print("-" * 40)
 
@@ -316,7 +324,8 @@ if len(df) < MINIMUM_RECORDS:
     stop_training(
         f"Insufficient training data. "
         f"Required: {MINIMUM_RECORDS}, "
-        f"Available after cleaning: {len(df)}."
+        f"Available after cleaning: {len(df)}.",
+        status="INSUFFICIENT_DATA"
     )
 
 
@@ -348,13 +357,14 @@ if number_of_intents < 2:
     )
 
 
-# Every intent needs at least two examples for
-# stratified train/test splitting.
-
-if intent_counts.min() < 2:
+# Require enough verified examples per class to reduce highly
+# unstable evaluation and avoid training on one-off labels.
+if intent_counts.min() < MINIMUM_EXAMPLES_PER_INTENT:
 
     stop_training(
-        "Every intent category needs at least two examples."
+        f"Every intent needs at least {MINIMUM_EXAMPLES_PER_INTENT} "
+        "human-verified examples.",
+        status="INSUFFICIENT_DATA"
     )
 
 
@@ -553,7 +563,8 @@ if accuracy < MINIMUM_ACCURACY:
     stop_training(
         f"Model accuracy {accuracy:.4f} is below "
         f"the required {MINIMUM_ACCURACY:.2f}. "
-        "Model will not be saved."
+        "Model will not be saved.",
+        status="QUALITY_REJECTED"
     )
 
 
