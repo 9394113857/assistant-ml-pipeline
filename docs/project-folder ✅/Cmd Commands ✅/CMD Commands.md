@@ -1,5 +1,7 @@
 Sure bro! 🫡 Run this **direct API command** in Postman or your terminal and share the live response.
 
+C:\Windows\System32\curl.exe -i https://assistant-service-g24j.onrender.com/
+
 **GET – Training Review Queue**
 
 ```
