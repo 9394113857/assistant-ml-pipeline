@@ -7,9 +7,10 @@ numpy==2.4.6
 # ==========================
 # Machine Learning
 # Keep these versions aligned with Assistant-Service.
+# Match the scikit-learn version used by the currently deployed model.
 # Python 3.11 compatible dependency set.
 # ==========================
-scikit-learn==1.9.1
+scikit-learn==1.5.0
 scipy==1.17.1
 joblib==1.6.0
 threadpoolctl==3.8.0
