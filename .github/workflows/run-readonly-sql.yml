@@ -1,14 +1,13 @@
-
 name: "Dynamic SQL Runner - Manual Only"
 
-# ONLY manual execution.
-# No push, pull_request, schedule or workflow_run triggers.
+# This workflow runs ONLY when a user clicks "Run workflow".
+# Commits, pushes, pull requests, schedules, and other workflows never trigger it.
 
 on:
   workflow_dispatch:
     inputs:
       sql_query:
-        description: "MANDATORY: Paste your SQL query here"
+        description: "MANDATORY: Paste one or more SELECT queries"
         required: true
         type: string
 
@@ -17,12 +16,11 @@ permissions:
 
 jobs:
   execute-sql:
-    name: Run user-provided read-only SQL
+    name: Execute user-provided read-only SQL
     runs-on: ubuntu-latest
     timeout-minutes: 1
 
     steps:
-      # STEP 1: Reject empty SQL immediately.
       - name: Validate mandatory SQL input
         env:
           SQL_QUERY: ${{ inputs.sql_query }}
@@ -31,16 +29,13 @@ jobs:
             echo "::error::SQL input is mandatory. Exiting."
             exit 1
           fi
-
           echo "SQL input received."
 
-      # STEP 2: Install only SQL execution dependencies.
-      - name: Install dependencies
+      - name: Install SQL dependencies
         run: |
-          pip install --quiet psycopg2-binary pglast
+          python -m pip install --quiet psycopg2-binary pglast sqlparse
 
-      # STEP 3: Execute dynamically supplied SQL.
-      - name: Execute read-only SQL queries
+      - name: Execute dynamic read-only SQL
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
           SQL_QUERY: ${{ inputs.sql_query }}
@@ -49,176 +44,152 @@ jobs:
           import os
           import sys
           import psycopg2
-          from pglast import parse_sql, split, ast
+          import sqlparse
+          from pglast import parse_sql, ast
 
           query = os.environ.get("SQL_QUERY", "").strip()
           database_url = os.environ.get("DATABASE_URL", "").strip()
-
-          summary = os.environ["GITHUB_STEP_SUMMARY"]
+          summary_path = os.environ["GITHUB_STEP_SUMMARY"]
 
           def fail(message):
-              with open(summary, "a", encoding="utf-8") as f:
-                  f.write("# Dynamic SQL Runner\n\n")
-                  f.write("**Status:** FAILED\n\n")
-                  f.write(f"**Error:** {message}\n")
+              with open(summary_path, "a", encoding="utf-8") as report:
+                  report.write("# Dynamic SQL Results\n\n")
+                  report.write("**Status:** FAILED\n\n")
+                  report.write(f"**Error:** {message}\n")
               print(f"::error::{message}")
               sys.exit(1)
 
-          # 1. Validate user input.
+          def markdown_value(value):
+              if value is None:
+                  return "NULL"
+              return (
+                  str(value)
+                  .replace("|", "\\|")
+                  .replace("\r", "")
+                  .replace("\n", "<br>")
+              )
+
           if not query:
-              fail("SQL query is empty. Manual input is required.")
+              fail("SQL input is empty. Paste a SQL query and run manually.")
 
           if not database_url:
-              fail("GitHub DATABASE_URL secret is missing.")
+              fail("The repository DATABASE_URL secret is missing.")
 
-          # 2. Split the input into individual SQL statements.
+          # sqlparse correctly separates multiple semicolon-terminated statements.
           try:
               statements = [
                   statement.strip()
-                  for statement in split(query)
+                  for statement in sqlparse.split(query)
                   if statement.strip()
               ]
           except Exception as error:
-              fail(f"SQL parsing failed: {error}")
+              fail(f"Could not split SQL input: {error}")
 
           if not statements:
-              fail("No SQL statements supplied.")
+              fail(
+                  "No SQL statements were detected. Paste complete "
+                  "SELECT statements, each terminated with a semicolon."
+              )
 
-          # 3. Validate every statement before executing any.
+          # Validate every statement before connecting to the database.
           for index, statement in enumerate(statements, start=1):
               try:
                   parsed = parse_sql(statement)
               except Exception as error:
-                  fail(f"Invalid SQL statement {index}: {error}")
+                  fail(f"SQL statement {index} is invalid: {error}")
 
               if len(parsed) != 1:
-                  fail(f"Statement {index}: multiple commands detected.")
+                  fail(f"SQL statement {index} must contain exactly one command.")
 
               if not isinstance(parsed[0].stmt, ast.SelectStmt):
                   fail(
-                      f"Statement {index}: only SELECT or "
-                      "WITH ... SELECT is allowed."
+                      f"SQL statement {index} is not a SELECT. "
+                      "Only SELECT and WITH ... SELECT are permitted."
                   )
 
           connection = None
 
           try:
-              # 4. Connect using the existing repository secret.
               connection = psycopg2.connect(
                   database_url,
                   connect_timeout=10,
                   sslmode="require"
               )
 
-              # 5. Enforce read-only transaction.
-              connection.set_session(
-                  readonly=True,
-                  autocommit=False
-              )
-
+              # PostgreSQL enforces read-only mode for this transaction.
+              connection.set_session(readonly=True, autocommit=False)
               cursor = connection.cursor()
+              result_sections = []
 
-              with open(summary, "a", encoding="utf-8") as report:
+              for index, statement in enumerate(statements, start=1):
+                  cursor.execute("SET LOCAL statement_timeout = '25s'")
+                  cursor.execute(statement)
 
-                  report.write("# Dynamic SQL Results\n\n")
-                  report.write("**Status:** SUCCESS\n\n")
-                  report.write("**Execution mode:** Read-only\n\n")
-                  report.write(
-                      f"**Queries supplied:** {len(statements)}\n\n"
+                  if cursor.description is None:
+                      raise RuntimeError(
+                          f"Query {index} returned no result columns."
+                      )
+
+                  columns = [column.name for column in cursor.description]
+                  rows = cursor.fetchmany(501)
+                  truncated = len(rows) > 500
+                  rows = rows[:500]
+
+                  section = [
+                      f"## Query {index}",
+                      f"**Rows returned:** {len(rows)}",
+                  ]
+
+                  if truncated:
+                      section.append("**Note:** Displaying the first 500 rows.")
+
+                  section.append(
+                      "| " + " | ".join(
+                          markdown_value(column) for column in columns
+                      ) + " |"
+                  )
+                  section.append(
+                      "| " + " | ".join(["---"] * len(columns)) + " |"
                   )
 
-                  # 6. Execute each user-provided SELECT query.
-                  for index, statement in enumerate(statements, start=1):
-
-                      cursor.execute(
-                          "SET LOCAL statement_timeout = '30s'"
+                  if not rows:
+                      section.append(
+                          "| " + " | ".join(
+                              ["No rows returned"] + [""] * (len(columns) - 1)
+                          ) + " |"
                       )
-
-                      cursor.execute(statement)
-
-                      if cursor.description is None:
-                          fail(
-                              f"Query {index} returned no result columns."
+                  else:
+                      for row in rows:
+                          section.append(
+                              "| " + " | ".join(
+                                  markdown_value(value) for value in row
+                              ) + " |"
                           )
 
-                      columns = [
-                          column.name
-                          for column in cursor.description
-                      ]
+                  result_sections.append("\n\n".join(section))
 
-                      rows = cursor.fetchmany(501)
-                      truncated = len(rows) > 500
-                      rows = rows[:500]
-
-                      def fmt(value):
-                          if value is None:
-                              return "NULL"
-
-                          return (
-                              str(value)
-                              .replace("|", "\\|")
-                              .replace("\r", "")
-                              .replace("\n", "<br>")
-                          )
-
-                      report.write(f"## Query {index}\n\n")
-                      report.write(
-                          f"**Rows returned:** {len(rows)}\n\n"
-                      )
-
-                      if truncated:
-                          report.write(
-                              "**Note:** Showing first 500 rows.\n\n"
-                          )
-
-                      report.write(
-                          "| " +
-                          " | ".join(fmt(column) for column in columns) +
-                          " |\n"
-                      )
-
-                      report.write(
-                          "| " +
-                          " | ".join(["---"] * len(columns)) +
-                          " |\n"
-                      )
-
-                      if not rows:
-                          report.write(
-                              "| " +
-                              " | ".join(
-                                  ["No rows returned"] +
-                                  [""] * (len(columns) - 1)
-                              ) +
-                              " |\n"
-                          )
-                      else:
-                          for row in rows:
-                              report.write(
-                                  "| " +
-                                  " | ".join(fmt(value) for value in row) +
-                                  " |\n"
-                              )
-
-                      report.write("\n")
-
-              # 7. Discard the read-only transaction.
+              # No database changes are committed.
               connection.rollback()
               cursor.close()
 
-              print("All SQL queries executed successfully.")
+              with open(summary_path, "a", encoding="utf-8") as report:
+                  report.write("# Dynamic SQL Results\n\n")
+                  report.write("**Status:** SUCCESS\n\n")
+                  report.write("**Execution mode:** Read-only transaction\n\n")
+                  report.write(
+                      f"**Queries executed:** {len(statements)}\n\n"
+                  )
+                  report.write("\n\n".join(result_sections))
+                  report.write("\n")
+
+              print(f"Successfully executed {len(statements)} SELECT query(s).")
 
           except Exception as error:
               if connection:
                   connection.rollback()
-
-              fail(
-                  f"Database execution failed: "
-                  f"{type(error).__name__}: {error}"
-              )
+              fail(f"{type(error).__name__}: {error}")
 
           finally:
               if connection:
                   connection.close()
-
           PY
