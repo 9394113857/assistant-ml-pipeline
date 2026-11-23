@@ -1,0 +1,216 @@
+
+name: "🔎 Dynamic Read-Only SQL Audit"
+
+on:
+  workflow_dispatch:
+    inputs:
+      sql_query:
+        description: "Paste one SELECT or WITH ... SELECT query"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  run-sql:
+    name: Execute SQL and publish Markdown results
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+
+    steps:
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install database and SQL parser libraries
+        run: |
+          python -m pip install --upgrade pip
+          pip install psycopg2-binary pglast
+
+      - name: Execute read-only SQL query
+        env:
+          DATABASE_URL: ${{ secrets.SUPABASE_READONLY_DATABASE_URL }}
+          SQL_QUERY: ${{ inputs.sql_query }}
+        run: |
+          python <<'PY'
+          import os
+          import sys
+          from datetime import date, datetime
+          from decimal import Decimal
+
+          import psycopg2
+          from pglast import parse_sql
+          from pglast import ast
+
+          OUTPUT_FILE = "sql-result.md"
+          MAX_ROWS = 500
+
+          def markdown_value(value):
+              if value is None:
+                  text = "NULL"
+              elif isinstance(value, (datetime, date)):
+                  text = value.isoformat()
+              elif isinstance(value, Decimal):
+                  text = str(value)
+              else:
+                  text = str(value)
+
+              return (
+                  text.replace("|", "\\|")
+                      .replace("\r\n", "<br>")
+                      .replace("\n", "<br>")
+                      .replace("\r", "<br>")
+              )
+
+          def write_failure(message):
+              with open(OUTPUT_FILE, "w", encoding="utf-8") as file:
+                  file.write("# SQL Audit Result\n\n")
+                  file.write("**Status:** FAILED\n\n")
+                  file.write(f"**Reason:** {message}\n")
+
+              print(message, file=sys.stderr)
+              sys.exit(1)
+
+          query = os.environ.get("SQL_QUERY", "").strip()
+          database_url = os.environ.get("DATABASE_URL", "").strip()
+
+          if not database_url:
+              write_failure(
+                  "Missing GitHub Secret: "
+                  "SUPABASE_READONLY_DATABASE_URL"
+              )
+
+          if not query:
+              write_failure("SQL query input is empty.")
+
+          # Parse the SQL before connecting.
+          # Exactly one SELECT-type statement is permitted.
+          try:
+              statements = parse_sql(query)
+          except Exception as error:
+              write_failure(f"SQL parsing failed: {error}")
+
+          if len(statements) != 1:
+              write_failure(
+                  "Only one SQL statement is allowed per workflow run."
+              )
+
+          if not isinstance(statements[0].stmt, ast.SelectStmt):
+              write_failure(
+                  "Only SELECT or WITH ... SELECT statements are allowed."
+              )
+
+          connection = None
+
+          try:
+              connection = psycopg2.connect(
+                  database_url,
+                  connect_timeout=10,
+                  sslmode="require"
+              )
+
+              # Enforce read-only mode at the PostgreSQL transaction level.
+              connection.set_session(
+                  readonly=True,
+                  autocommit=False
+              )
+
+              cursor = connection.cursor()
+
+              # Prevent expensive queries from running indefinitely.
+              cursor.execute("SET LOCAL statement_timeout = '30s'")
+
+              cursor.execute(query)
+
+              if cursor.description is None:
+                  write_failure("The query did not return a result set.")
+
+              columns = [column.name for column in cursor.description]
+
+              # Fetch one extra row to detect whether results were truncated.
+              rows = cursor.fetchmany(MAX_ROWS + 1)
+              truncated = len(rows) > MAX_ROWS
+              rows = rows[:MAX_ROWS]
+
+              with open(OUTPUT_FILE, "w", encoding="utf-8") as file:
+                  file.write("# Dynamic SQL Audit Result\n\n")
+                  file.write("**Status:** SUCCESS\n\n")
+                  file.write("**Execution mode:** Read-only transaction\n\n")
+                  file.write(f"**Rows returned:** {len(rows)}\n\n")
+
+                  if truncated:
+                      file.write(
+                          f"**Note:** Results limited to the first "
+                          f"{MAX_ROWS} rows. Refine the query to inspect "
+                          "additional records.\n\n"
+                      )
+
+                  if not columns:
+                      file.write("No result columns returned.\n")
+                  else:
+                      file.write("| " + " | ".join(
+                          markdown_value(column) for column in columns
+                      ) + " |\n")
+
+                      file.write("| " + " | ".join(
+                          ["---"] * len(columns)
+                      ) + " |\n")
+
+                      if not rows:
+                          file.write(
+                              "| " + " | ".join(
+                                  ["No rows returned"] +
+                                  [""] * (len(columns) - 1)
+                              ) + " |\n"
+                          )
+                      else:
+                          for row in rows:
+                              values = [
+                                  markdown_value(value)
+                                  for value in row
+                              ]
+                              file.write(
+                                  "| " + " | ".join(values) + " |\n"
+                              )
+
+              # End the read-only transaction without modifying data.
+              connection.rollback()
+              cursor.close()
+
+              print("SQL query completed successfully.")
+              print(f"Rows returned: {len(rows)}")
+              print(f"Markdown result saved to {OUTPUT_FILE}")
+
+          except Exception as error:
+              if connection:
+                  connection.rollback()
+
+              write_failure(
+                  f"Database execution failed: "
+                  f"{type(error).__name__}: {error}"
+              )
+
+          finally:
+              if connection:
+                  connection.close()
+          PY
+
+      - name: Publish Markdown result in GitHub Actions summary
+        if: always()
+        run: |
+          if [ -f sql-result.md ]; then
+            cat sql-result.md >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "# SQL Audit Result" >> "$GITHUB_STEP_SUMMARY"
+            echo "No result file was generated." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload SQL result as downloadable artifact
+        if: always() && hashFiles('sql-result.md') != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: sql-audit-result
+          path: sql-result.md
+          retention-days: 7
