@@ -53,9 +53,9 @@ jobs:
 
           def fail(message):
               with open(summary_path, "a", encoding="utf-8") as report:
-                  report.write("# Dynamic SQL Results\\n\\n")
-                  report.write("**Status:** FAILED\\n\\n")
-                  report.write(f"**Error:** {message}\\n")
+                  report.write("# Dynamic SQL Results\n\n")
+                  report.write("**Status:** FAILED\n\n")
+                  report.write(f"**Error:** {message}\n")
               print(f"::error::{message}")
               sys.exit(1)
 
@@ -64,20 +64,18 @@ jobs:
                   return "NULL"
               return (
                   str(value)
-                  .replace("|", "\\\\|")
-                  .replace("\\r", "")
-                  .replace("\\n", "<br>")
+                  .replace("|", "\\|")
+                  .replace("\r", "")
+                  .replace("\n", "<br>")
               )
 
-          # Validate the required runtime inputs.
           if not query:
               fail("SQL input is empty. Paste a SQL query and run manually.")
 
           if not database_url:
               fail("The repository DATABASE_URL secret is missing.")
 
-          # Split the supplied script with sqlparse.
-          # pglast.split() is intentionally not used here.
+          # sqlparse correctly separates multiple semicolon-terminated statements.
           try:
               statements = [
                   statement.strip()
@@ -93,7 +91,7 @@ jobs:
                   "SELECT statements, each terminated with a semicolon."
               )
 
-          # Parse and validate EVERY statement before opening a DB connection.
+          # Validate every statement before connecting to the database.
           for index, statement in enumerate(statements, start=1):
               try:
                   parsed = parse_sql(statement)
@@ -101,10 +99,7 @@ jobs:
                   fail(f"SQL statement {index} is invalid: {error}")
 
               if len(parsed) != 1:
-                  fail(
-                      f"SQL statement {index} must contain exactly "
-                      "one command."
-                  )
+                  fail(f"SQL statement {index} must contain exactly one command.")
 
               if not isinstance(parsed[0].stmt, ast.SelectStmt):
                   fail(
@@ -115,18 +110,15 @@ jobs:
           connection = None
 
           try:
-              # Reuse the existing DATABASE_URL repository secret.
               connection = psycopg2.connect(
                   database_url,
                   connect_timeout=10,
                   sslmode="require"
               )
 
-              # Enforce a read-only PostgreSQL transaction.
+              # PostgreSQL enforces read-only mode for this transaction.
               connection.set_session(readonly=True, autocommit=False)
               cursor = connection.cursor()
-
-              # Collect results first so failed runs do not show a false SUCCESS.
               result_sections = []
 
               for index, statement in enumerate(statements, start=1):
@@ -143,14 +135,13 @@ jobs:
                   truncated = len(rows) > 500
                   rows = rows[:500]
 
-                  section = []
-                  section.append(f"## Query {index}\\n")
-                  section.append(f"**Rows returned:** {len(rows)}\\n")
+                  section = [
+                      f"## Query {index}",
+                      f"**Rows returned:** {len(rows)}",
+                  ]
 
                   if truncated:
-                      section.append(
-                          "**Note:** Displaying the first 500 rows.\\n"
-                      )
+                      section.append("**Note:** Displaying the first 500 rows.")
 
                   section.append(
                       "| " + " | ".join(
@@ -175,21 +166,21 @@ jobs:
                               ) + " |"
                           )
 
-                  result_sections.append("\\n".join(section))
+                  result_sections.append("\n\n".join(section))
 
-              # Discard the read-only transaction after all queries succeed.
+              # No database changes are committed.
               connection.rollback()
               cursor.close()
 
               with open(summary_path, "a", encoding="utf-8") as report:
-                  report.write("# Dynamic SQL Results\\n\\n")
-                  report.write("**Status:** SUCCESS\\n\\n")
-                  report.write("**Execution mode:** Read-only transaction\\n\\n")
+                  report.write("# Dynamic SQL Results\n\n")
+                  report.write("**Status:** SUCCESS\n\n")
+                  report.write("**Execution mode:** Read-only transaction\n\n")
                   report.write(
-                      f"**Queries executed:** {len(statements)}\\n\\n"
+                      f"**Queries executed:** {len(statements)}\n\n"
                   )
-                  report.write("\\n\\n".join(result_sections))
-                  report.write("\\n")
+                  report.write("\n\n".join(result_sections))
+                  report.write("\n")
 
               print(f"Successfully executed {len(statements)} SELECT query(s).")
 
