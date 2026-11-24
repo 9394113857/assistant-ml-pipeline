@@ -511,6 +511,7 @@ try:
         y_test,
         predictions
     )
+    model_accuracy = f"{accuracy:.4f}"
 
     print(f"\n📊 MODEL ACCURACY: {accuracy:.4f}")
 
