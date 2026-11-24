@@ -261,4 +261,122 @@ One step at a time, bro. We'll trace it properly. 🤝
 
 ==========================================
 
+Brooo, Step 1 inspection is approved and underway. I’ve confirmed one important thing already: **the current&#x20;**`train.py`**&#x20;does not actually use&#x20;**`predicted_intent`**&#x20;as a fallback**. It filters for non-empty `actual_intent` and trains only on that column. However, some comments and reporting messages still describe the older fallback behavior.
+
+I’m checking the directly related data-loading and training files next, so I can distinguish a real logic problem from a documentation/reporting mismatch. No files have been edited.
+
+## **Step 1 — Findings**
+
+I inspected the current `main` branch of `assistant-ml-pipeline`, including `train.py`, the retraining workflow, and the related SQL audit/reconciliation files.
+
+
+
+Confirmed data-quality issue
+
+**1.&#x20;**`train.py`**&#x20;does not verify human-review audit fields**
+
+
+
+The training query currently selects only:
+
+- `user_message`
+- `predicted_intent`
+- `actual_intent`
+
+It filters for non-empty `actual_intent`, but it does **not** require either `reviewer_user_id` or `reviewed_at`.
+
+That means a populated `actual_intent` is treated as a human-verified label even when there is no review audit evidence.
+
+This is important because our latest diagnostics found:
+
+| Database check               | Result |
+| ---------------------------- | ------ |
+| Total training-log records   | 186    |
+| Records with `actual_intent` | 180    |
+| Fully audited records        | **0**  |
+| Records missing review audit | 186    |
+
+So the current training query can accept labels that have not been demonstrated to be human-reviewed. This is the biggest issue found in Step 1.
+
+**2. The training comments and reporting are inconsistent with the actual logic**
+
+The code contains several outdated statements:
+
+- The header says `predicted_intent` is a fallback when `actual_intent` is empty.
+- The cleaning comments say the model uses human-verified labels.
+- The input/target example says predicted labels may be used as a fallback.
+- `corrected_rows` and `fallback_rows` are calculated as if both types of labels can enter training.
+
+But the SQL excludes empty `actual_intent` records before training. Therefore:
+
+- `corrected_rows` will equal the number of cleaned training rows.
+- `fallback_rows` will always be zero.
+
+This is a reporting/documentation bug, not the cause of the failed training run.
+
+**3. The duplicate check is not fully normalized**
+
+The code removes duplicates using the exact `user_message` and `training_intent` values after trimming whitespace.
+
+It does not normalize letter case. For example, `"Show products"` and `"show products"` can remain separate examples even if they represent the same message.
+
+It also deliberately retains the same message with different labels. That can be useful for investigation, but conflicting labels should be detected and reported before training.
+
+**4. The minimum-data checks are working as intended**
+
+The code requires:
+
+- At least 30 usable records.
+- At least two intent categories.
+- At least five examples per intent.
+- Enough records for a stratified train/test split.
+- At least 70% validation accuracy before saving the model.
+
+The previous run's insufficient-data rejection is consistent with those checks. The minimum-five-per-intent rule is not automatically a bug; we should preserve it unless later evidence supports a change.
+
+## **Why the previous training run failed**
+
+The earlier run reported 133 unique usable rows across 23 intent categories. Some categories had fewer than five examples, so training stopped before model fitting.
+
+However, the more fundamental issue is that **those 133 rows were not proven to be human-reviewed**. The current code does not check the review audit fields.
+
+So I would not solve this by lowering the minimum threshold or adding synthetic records.
+
+## **Recommended correction — not applied yet**
+
+I recommend that we eventually make these changes to `train.py`:
+
+1. Require both `reviewer_user_id` and `reviewed_at` to be populated before a record qualifies as verified training data.
+2. Select those audit columns in the training query.
+3. Make the training report distinguish total labelled records, fully audited records, and eligible training records.
+4. Remove the misleading predicted-label fallback comments and calculations.
+5. Detect normalized duplicate messages and conflicting labels, then report them clearly.
+6. Preserve the existing minimum-data and accuracy checks for now.
+
+The relevant files are [train.py](https://github.com/9394113857/assistant-ml-pipeline/blob/main/train.py?utm_source=chatgpt.com) and the [human-review audit SQL](https://github.com/9394113857/assistant-ml-pipeline/tree/main/docs/project-folder%20%E2%9C%85/SQL%20Queries%20%E2%9C%85?utm_source=chatgpt.com).
+
+## **Your approval for the next action**
+
+My recommendation is to fix the confirmed training-data eligibility issue first, before touching the GitHub Actions workflow.
+
+**What I propose editing:** only `train.py`, on a feature branch. I will show you the exact proposed logic before applying it. No database records will be modified, and no workflow or deployment will be triggered by this inspection.
+
+**Shall we proceed with the&#x20;**`train.py`**&#x20;correction?**
+
+Yes bro — propose and apply the audit-validation fix in train.py only, after showing me the exact change.
+
+Wait bro — discuss the findings first.
+
+Inspect the current training-data SQL logic further before editing.
+
+Continue
+
+No files have been changed, bro. We’ll keep it one step at a time.
+
+=========================================================
+
+continue
+
+
+
 
