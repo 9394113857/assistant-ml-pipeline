@@ -5,7 +5,7 @@ import math
 import pandas as pd
 import joblib
 
-from sqlalchemy import create_engine, text
+from sqlalchemy import create_engine, text, event
 
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.linear_model import LogisticRegression
@@ -61,6 +61,34 @@ MINIMUM_EXAMPLES_PER_INTENT = 5
 MODEL_PATH = "models/assistant_intent_model.pkl"
 
 TABLE_NAME = "public.assistant_training_logs"
+
+
+def create_read_only_engine():
+    """Create and verify a PostgreSQL SQLAlchemy engine in read-only mode."""
+
+    engine = create_engine(
+        DATABASE_URL,
+        pool_pre_ping=True,
+        connect_args={
+            "options": "-c default_transaction_read_only=on"
+        }
+    )
+
+    @event.listens_for(engine, "connect")
+    def verify_read_only_connection(dbapi_connection, connection_record):
+        cursor = dbapi_connection.cursor()
+        try:
+            cursor.execute("SHOW transaction_read_only")
+            mode = cursor.fetchone()[0]
+            if mode != "on":
+                raise RuntimeError(
+                    "PostgreSQL connection is not read-only."
+                )
+        finally:
+            cursor.close()
+            dbapi_connection.rollback()
+
+    return engine
 
 
 # ==========================================================
@@ -136,10 +164,7 @@ print("\n✅ DATABASE_URL environment variable found.")
 
 try:
 
-    engine = create_engine(
-        DATABASE_URL,
-        pool_pre_ping=True
-    )
+    engine = create_read_only_engine()
 
     # Test the connection and inspect the database context.
     # This diagnostic query helps compare GitHub Actions
@@ -219,10 +244,7 @@ try:
     # Re-create the engine because the diagnostic engine
     # was disposed after its connection test.
 
-    engine = create_engine(
-        DATABASE_URL,
-        pool_pre_ping=True
-    )
+    engine = create_read_only_engine()
 
     df = pd.read_sql(
         query,
