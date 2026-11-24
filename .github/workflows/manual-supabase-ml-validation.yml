@@ -51,6 +51,8 @@ jobs:
 
       - name: 🔐 Validate Database Configuration
         shell: bash
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
         run: |
           if [ -z "$DATABASE_URL" ]; then
             echo "::error::DATABASE_URL secret is missing."
