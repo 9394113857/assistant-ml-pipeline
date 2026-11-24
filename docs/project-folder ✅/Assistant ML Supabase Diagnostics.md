@@ -375,7 +375,105 @@ No files have been changed, bro. We’ll keep it one step at a time.
 
 =========================================================
 
-continue
+Absolutely bro! ❤️ Before editing anything, here is the exact change I propose for `train.py`.
+
+**Scope: audit-validation only.** We will not change the model algorithm, minimum thresholds, accuracy threshold, database records, or GitHub Actions workflow.
+
+## **1. Change the SQL query**
+
+**Current query:**
+
+```
+query = """SELECT    user_message,    predicted_intent,    actual_intentFROM public.assistant_training_logsWHERE actual_intent IS NOT NULL  AND TRIM(actual_intent) <> ''  AND user_message IS NOT NULL  AND TRIM(user_message) <> ''ORDER BY id ASC"""
+```
+
+**Proposed query:**
+
+```
+query = """SELECT    user_message,    predicted_intent,    actual_intent,    reviewer_user_id,    reviewed_atFROM public.assistant_training_logsWHERE actual_intent IS NOT NULL  AND TRIM(actual_intent) <> ''  AND user_message IS NOT NULL  AND TRIM(user_message) <> ''ORDER BY id ASC"""
+```
+
+Why? We need to retrieve the review audit fields rather than assuming that a populated `actual_intent` means the record was reviewed.
+
+## **2. Add audit validation during data cleaning**
+
+After loading the DataFrame, we will validate both fields.
+
+**Proposed replacement for the relevant cleaning logic:**
+
+```
+# Remove records with missing required values.df = df.dropna(    subset=["user_message", "actual_intent"]).copy()# Normalize text fields.df["user_message"] = df["user_message"].astype(str).str.strip()df["actual_intent"] = df["actual_intent"].astype(str).str.strip()# A record is eligible only when BOTH review audit fields exist.audit_valid = (    df["reviewer_user_id"].notna()    & df["reviewed_at"].notna())audit_rejected_rows = len(df) - audit_valid.sum()# Keep only records with complete review audit information.df = df[audit_valid].copy()# Remove empty messages and labels.df = df[    (df["user_message"] != "")    & (df["actual_intent"] != "")].copy()# The target is exclusively the audit-qualified actual intent.df["training_intent"] = df["actual_intent"]# Remove exact duplicate message + intent combinations.df = df.drop_duplicates(    subset=["user_message", "training_intent"]).reset_index(drop=True)training_rows = len(df)print("\n🔎 HUMAN REVIEW AUDIT REPORT")print("-" * 40)print(f"Rows rejected for incomplete audit: {audit_rejected_rows}")print(f"Audit-qualified training rows: {training_rows}")print("-" * 40)
+```
+
+This makes the eligibility rule explicit:
+
+**Training eligibility**
+
+`actual_intent` populated
+
+Required
+
+`reviewer_user_id` populated
+
+Required
+
+`reviewed_at` populated
+
+Required
+
+All three conditions satisfied
+
+Eligible
+
+Any condition missing
+
+Rejected
+
+## **3. What happens with our current database?**
+
+Based on the latest diagnostics:
+
+| Measurement                       | Current result |
+| --------------------------------- | -------------- |
+| Total database rows               | 186            |
+| Populated actual intents          | 180            |
+| Complete review audit             | 0              |
+| Eligible rows under proposed rule | **0**          |
+
+So the next training attempt will correctly stop with `INSUFFICIENT_DATA`.
+
+That is intentional. We should not train a model using labels whose review provenance has not been established.
+
+One important distinction: complete audit fields establish that review metadata exists; they do not independently prove the quality of the review itself.
+
+## **4. Expected behavior after this correction**
+
+- If there are zero audit-qualified examples, training stops safely.
+- If there are some, only those records enter the training dataset.
+- The existing minimum of 30 records remains.
+- The existing five-examples-per-intent rule remains.
+- The existing 70% accuracy requirement remains.
+- No model is saved unless all existing validation gates pass.
+
+**I would also clean up the outdated comments and the misleading&#x20;**`fallback_rows`**&#x20;reporting in the same edit**, because the current implementation does not use predicted-intent fallback. That is a documentation/reporting correction, not a change to the training policy.
+
+## **Final approval before editing**
+
+No edits made yet
+
+**Do you approve this exact&#x20;**`train.py`**&#x20;change?**
+
+Yes bro — apply the audit-validation change and clean up the outdated comments/reporting in train.py only.
+
+Apply only the audit-validation change. Leave comments/reporting for later.
+
+Wait — I want to discuss something first.
+
+Submit approval
+
+We'll wait for your confirmation before touching the code, bro. ❤️
+
+========
 
 
 
