@@ -1,0 +1,268 @@
+name: "🗄️ Manual - Assistant ML Supabase Diagnostics"
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: assistant-ml-supabase-diagnostics
+  cancel-in-progress: false
+
+jobs:
+  database-diagnostics:
+    name: Read-only Supabase Database Report
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    env:
+      DATABASE_URL: ${{ secrets.DATABASE_URL }}
+      PYTHONUNBUFFERED: "1"
+      TZ: Asia/Kolkata
+
+    steps:
+      - name: 📥 Checkout ML Repository
+        uses: actions/checkout@v4
+
+      - name: 🐍 Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: 📦 Install PostgreSQL Driver
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install "psycopg2-binary==2.9.11"
+
+      - name: 🔐 Validate Database Configuration
+        shell: bash
+        run: |
+          if [ -z "$DATABASE_URL" ]; then
+            echo "::error::DATABASE_URL secret is missing."
+            echo "Configure the Supabase PostgreSQL connection string as the repository secret DATABASE_URL."
+            exit 1
+          fi
+          echo "DATABASE_URL secret is present. Its value will not be printed."
+
+      - name: 🔍 Run Read-only Supabase Diagnostics
+        run: |
+          python - <<'PY'
+          import os
+          import sys
+          from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode
+
+          import psycopg2
+          from psycopg2 import sql
+
+          raw_url = os.environ.get("DATABASE_URL", "").strip()
+          if not raw_url:
+              print("DIAGNOSTIC_STATUS=FAILED")
+              sys.exit("DATABASE_URL is missing.")
+
+          # Accept common SQLAlchemy PostgreSQL URL schemes.
+          database_url = raw_url.replace("postgresql+psycopg2://", "postgresql://", 1)
+          database_url = database_url.replace("postgresql+psycopg://", "postgresql://", 1)
+          parsed = urlsplit(database_url)
+          query_params = dict(parse_qsl(parsed.query, keep_blank_values=True))
+          query_params.setdefault("sslmode", "require")
+          database_url = urlunsplit((
+              parsed.scheme,
+              parsed.netloc,
+              parsed.path,
+              urlencode(query_params),
+              parsed.fragment,
+          ))
+
+          # Print only non-secret connection metadata.
+          safe_host = parsed.hostname or "not-parsed"
+          safe_database = parsed.path.lstrip("/") or "not-parsed"
+
+          expected_tables = ["assistant_training_logs"]
+
+          print("=" * 76)
+          print("ASSISTANT ML PIPELINE - SUPABASE DATABASE DIAGNOSTICS")
+          print("=" * 76)
+          print(f"Execution timezone : {os.environ.get('TZ', 'UTC')}")
+          print(f"Database host      : {safe_host}")
+          print(f"Database name      : {safe_database}")
+          print("Connection secret  : PRESENT (value hidden)")
+          print("Access mode        : READ ONLY")
+          print("-" * 76)
+
+          connection = None
+          try:
+              connection = psycopg2.connect(
+                  database_url,
+                  connect_timeout=15,
+                  application_name="assistant-ml-readonly-diagnostics"
+              )
+              connection.set_session(readonly=True, autocommit=False)
+
+              with connection.cursor() as cursor:
+                  cursor.execute("SELECT current_database(), current_schema(), current_user")
+                  db_name, schema_name, db_user = cursor.fetchone()
+                  cursor.execute("SHOW server_version")
+                  pg_version = cursor.fetchone()[0]
+
+                  print("CONNECTION")
+                  print("-" * 76)
+                  print("Supabase connection : SUCCESS")
+                  print(f"Current database    : {db_name}")
+                  print(f"Current schema      : {schema_name}")
+                  print(f"Database role       : {db_user}")
+                  print(f"PostgreSQL version  : {pg_version}")
+
+                  cursor.execute("""
+                      SELECT table_name
+                      FROM information_schema.tables
+                      WHERE table_schema = 'public'
+                        AND table_type = 'BASE TABLE'
+                      ORDER BY table_name
+                  """)
+                  tables = [row[0] for row in cursor.fetchall()]
+                  table_set = set(tables)
+
+                  print("\nPUBLIC SCHEMA")
+                  print("-" * 76)
+                  print(f"Public table count  : {len(tables)}")
+                  for table_name in tables:
+                      print(f"  - {table_name}")
+
+                  print("\nML TRAINING TABLE")
+                  print("-" * 76)
+                  missing = []
+                  table_name = "assistant_training_logs"
+
+                  if table_name not in table_set:
+                      print(f"{table_name}: NOT FOUND")
+                      missing.append(table_name)
+                  else:
+                      cursor.execute(
+                          sql.SQL("SELECT COUNT(*) FROM {}.{}").format(
+                              sql.Identifier("public"),
+                              sql.Identifier(table_name)
+                          )
+                      )
+                      total_rows = cursor.fetchone()[0]
+                      print(f"{table_name}: EXISTS")
+                      print(f"Total training rows : {total_rows}")
+
+                      cursor.execute("""
+                          SELECT column_name, data_type, is_nullable
+                          FROM information_schema.columns
+                          WHERE table_schema = 'public'
+                            AND table_name = 'assistant_training_logs'
+                          ORDER BY ordinal_position
+                      """)
+                      columns = cursor.fetchall()
+                      column_names = {row[0] for row in columns}
+                      print("Columns:")
+                      for name, data_type, nullable in columns:
+                          print(f"  - {name} ({data_type}, nullable={nullable})")
+
+                      if "predicted_intent" in column_names:
+                          cursor.execute("""
+                              SELECT COALESCE(NULLIF(BTRIM(predicted_intent), ''), '[blank]'), COUNT(*)
+                              FROM public.assistant_training_logs
+                              GROUP BY 1
+                              ORDER BY COUNT(*) DESC, 1
+                          """)
+                          print("\nPredicted intent distribution:")
+                          for intent, count in cursor.fetchall():
+                              print(f"  - {intent}: {count}")
+
+                      if "actual_intent" in column_names:
+                          cursor.execute("""
+                              SELECT
+                                COUNT(*) FILTER (
+                                  WHERE actual_intent IS NOT NULL
+                                    AND BTRIM(actual_intent) <> ''
+                                ),
+                                COUNT(*) FILTER (
+                                  WHERE actual_intent IS NULL
+                                     OR BTRIM(actual_intent) = ''
+                                )
+                              FROM public.assistant_training_logs
+                          """)
+                          labeled, unlabeled = cursor.fetchone()
+                          print("\nHuman label coverage:")
+                          print(f"Rows with actual_intent    : {labeled}")
+                          print(f"Rows without actual_intent : {unlabeled}")
+
+                          cursor.execute("""
+                              SELECT
+                                COALESCE(NULLIF(BTRIM(actual_intent), ''), '[blank]'),
+                                COUNT(*)
+                              FROM public.assistant_training_logs
+                              GROUP BY 1
+                              ORDER BY COUNT(*) DESC, 1
+                          """)
+                          print("\nActual intent distribution:")
+                          for intent, count in cursor.fetchall():
+                              print(f"  - {intent}: {count}")
+
+                      audit_columns = {"reviewer_user_id", "reviewed_at"}
+                      if audit_columns.issubset(column_names):
+                          cursor.execute("""
+                              SELECT
+                                COUNT(*) FILTER (
+                                  WHERE reviewer_user_id IS NOT NULL
+                                    AND reviewed_at IS NOT NULL
+                                ),
+                                COUNT(*) FILTER (
+                                  WHERE reviewer_user_id IS NULL
+                                     OR reviewed_at IS NULL
+                                )
+                              FROM public.assistant_training_logs
+                          """)
+                          audited, not_audited = cursor.fetchone()
+                          print("\nHuman review audit:")
+                          print(f"Fully audited rows     : {audited}")
+                          print(f"Not fully audited rows : {not_audited}")
+                      else:
+                          print("\nHuman review audit: reviewer_user_id/reviewed_at columns not both present.")
+
+                      if "model_version" in column_names:
+                          cursor.execute("""
+                              SELECT COALESCE(NULLIF(BTRIM(model_version), ''), '[blank]'), COUNT(*)
+                              FROM public.assistant_training_logs
+                              GROUP BY 1
+                              ORDER BY COUNT(*) DESC, 1
+                          """)
+                          print("\nModel version distribution:")
+                          for version, count in cursor.fetchall():
+                              print(f"  - {version}: {count}")
+
+                  print("\n" + "=" * 76)
+                  print("DIAGNOSTIC_STATUS=SUCCESS")
+                  print(f"PUBLIC_TABLE_COUNT={len(tables)}")
+                  print(f"MISSING_ML_TABLES={len(missing)}")
+                  print("DATABASE_ACCESS=READ_ONLY")
+                  print("No chat contents, user identifiers, or row-level records were printed.")
+                  print("No INSERT, UPDATE, DELETE, DDL, or migration commands were executed.")
+                  print("=" * 76)
+
+              connection.rollback()
+
+          except Exception as error:
+              if connection:
+                  connection.rollback()
+              print("\n" + "=" * 76)
+              print("DIAGNOSTIC_STATUS=FAILED")
+              print(f"ERROR_TYPE={type(error).__name__}")
+              print("Check DATABASE_URL format, GitHub secret configuration, network access, and Supabase availability.")
+              print("=" * 76)
+              sys.exit(1)
+
+          finally:
+              if connection:
+                  connection.close()
+          PY
+
+      - name: 📋 Diagnostics Summary
+        if: always()
+        run: |
+          echo "Assistant ML Supabase diagnostics workflow finished."
+          echo "Review the 'Run Read-only Supabase Diagnostics' step for the report."
+          echo "This workflow is manually triggered and read-only."
