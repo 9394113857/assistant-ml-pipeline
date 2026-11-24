@@ -216,7 +216,6 @@ jobs:
                   connection.rollback()
               report["preflight_status"] = "FAILED"
               report["error_type"] = type(error).__name__
-              report["error_message"] = str(error)
               with open("validation-artifacts/supabase_preflight.json", "w", encoding="utf-8") as handle:
                   json.dump(report, handle, indent=2)
               print("SUPABASE_PREFLIGHT=FAILED")
@@ -237,6 +236,23 @@ jobs:
           print(f"AUDIT_INCOMPLETE_CANDIDATES={report['candidate_rows_with_incomplete_review_audit']}")
           print("DATABASE_ACCESS=READ_ONLY")
           print("No raw user messages or row-level identifiers were selected or printed.")
+          PY
+
+      - name: 🔒 Verify SQLAlchemy Training Connection Is Read-only
+        run: |
+          python - <<'PY'
+          import os
+          from sqlalchemy import create_engine, text
+
+          engine = create_engine(os.environ["DATABASE_URL"], pool_pre_ping=True)
+          try:
+              with engine.connect() as connection:
+                  mode = connection.execute(text("SHOW transaction_read_only")).scalar_one()
+                  print(f"SQLALCHEMY_TRANSACTION_READ_ONLY={mode}")
+                  if mode != "on":
+                      raise SystemExit("Training SQLAlchemy connection is not read-only.")
+          finally:
+              engine.dispose()
           PY
 
       - name: 🧪 Verify Training Script Uses Read-only SQL
