@@ -249,7 +249,13 @@ jobs:
           import os
           from sqlalchemy import create_engine, text
 
-          engine = create_engine(os.environ["DATABASE_URL"], pool_pre_ping=True)
+          engine = create_engine(
+              os.environ["DATABASE_URL"],
+              pool_pre_ping=True,
+              connect_args={
+                  "options": "-c default_transaction_read_only=on"
+              }
+          )
           try:
               with engine.connect() as connection:
                   mode = connection.execute(text("SHOW transaction_read_only")).scalar_one()
