@@ -17,7 +17,6 @@ jobs:
     timeout-minutes: 20
 
     env:
-      DATABASE_URL: ${{ secrets.DATABASE_URL }}
       PGOPTIONS: "-c default_transaction_read_only=on"
       PYTHONUNBUFFERED: "1"
       TZ: Asia/Kolkata
@@ -52,6 +51,8 @@ jobs:
 
       - name: 🔐 Validate Database Configuration
         shell: bash
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
         run: |
           if [ -z "$DATABASE_URL" ]; then
             echo "::error::DATABASE_URL secret is missing."
@@ -61,6 +62,8 @@ jobs:
 
       - name: 🔍 Inspect Supabase Schema and Training Data (Read-only)
         id: preflight
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
         run: |
           mkdir -p validation-artifacts
           python - <<'PY'
@@ -239,6 +242,8 @@ jobs:
           PY
 
       - name: 🔒 Verify SQLAlchemy Training Connection Is Read-only
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
         run: |
           python - <<'PY'
           import os
@@ -290,6 +295,8 @@ jobs:
 
       - name: 🚀 Run Feature-Branch Training (Read-only DB Session)
         id: training
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
         continue-on-error: true
         run: |
           set -o pipefail
