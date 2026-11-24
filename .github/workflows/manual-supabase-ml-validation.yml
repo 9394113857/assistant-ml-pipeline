@@ -1,0 +1,370 @@
+name: "🧪 Manual - Supabase ML Training Validation (Feature Branch)"
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: assistant-ml-feature-branch-supabase-validation
+  cancel-in-progress: false
+
+jobs:
+  validate-and-train:
+    name: Read-only Supabase fetch and isolated model validation
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    env:
+      DATABASE_URL: ${{ secrets.DATABASE_URL }}
+      PGOPTIONS: "-c default_transaction_read_only=on"
+      PYTHONUNBUFFERED: "1"
+      TZ: Asia/Kolkata
+
+    steps:
+      - name: 🛑 Require the approved feature branch
+        shell: bash
+        run: |
+          if [ "${GITHUB_REF}" != "refs/heads/fix/training-audit-validation" ]; then
+            echo "::error::This validation workflow is restricted to fix/training-audit-validation."
+            exit 1
+          fi
+          echo "Approved feature branch confirmed."
+
+      - name: 📥 Checkout Feature Branch
+        uses: actions/checkout@v4
+        with:
+          ref: fix/training-audit-validation
+          persist-credentials: false
+
+      - name: 🐍 Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: 📦 Install ML Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+
+      - name: 🔐 Validate Database Configuration
+        shell: bash
+        run: |
+          if [ -z "$DATABASE_URL" ]; then
+            echo "::error::DATABASE_URL secret is missing."
+            exit 1
+          fi
+          echo "DATABASE_URL is configured. Secret value will not be printed."
+
+      - name: 🔍 Inspect Supabase Schema and Training Data (Read-only)
+        id: preflight
+        run: |
+          mkdir -p validation-artifacts
+          python - <<'PY'
+          import json
+          import os
+          import sys
+          from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+
+          import psycopg2
+
+          raw_url = os.environ.get("DATABASE_URL", "").strip()
+          if not raw_url:
+              raise SystemExit("DATABASE_URL is missing.")
+
+          normalized_url = raw_url.replace("postgresql+psycopg2://", "postgresql://", 1)
+          normalized_url = normalized_url.replace("postgresql+psycopg://", "postgresql://", 1)
+          parsed = urlsplit(normalized_url)
+          query = dict(parse_qsl(parsed.query, keep_blank_values=True))
+          query.setdefault("sslmode", "require")
+          safe_url = urlunsplit((
+              parsed.scheme,
+              parsed.netloc,
+              parsed.path,
+              urlencode(query),
+              parsed.fragment,
+          ))
+
+          report = {
+              "database_host": parsed.hostname or "unknown",
+              "database_name": parsed.path.lstrip("/") or "unknown",
+              "access_mode": "READ_ONLY",
+              "table": "public.assistant_training_logs",
+          }
+
+          connection = None
+          try:
+              connection = psycopg2.connect(
+                  safe_url,
+                  connect_timeout=15,
+                  application_name="assistant-ml-feature-branch-validation",
+              )
+              connection.set_session(readonly=True, autocommit=False)
+
+              with connection.cursor() as cursor:
+                  cursor.execute("SHOW transaction_read_only")
+                  read_only = cursor.fetchone()[0]
+                  if read_only != "on":
+                      raise RuntimeError("PostgreSQL did not confirm a read-only transaction.")
+
+                  cursor.execute("""
+                      SELECT current_database(), current_schema(), current_user, version()
+                  """)
+                  database, schema, role, version = cursor.fetchone()
+                  report.update({
+                      "connection": "SUCCESS",
+                      "current_database": database,
+                      "current_schema": schema,
+                      "database_role": role,
+                      "postgres_version": version.split(",")[0],
+                      "transaction_read_only": read_only,
+                  })
+
+                  cursor.execute("""
+                      SELECT column_name, data_type, is_nullable
+                      FROM information_schema.columns
+                      WHERE table_schema = 'public'
+                        AND table_name = 'assistant_training_logs'
+                      ORDER BY ordinal_position
+                  """)
+                  columns = cursor.fetchall()
+                  column_names = {row[0] for row in columns}
+                  report["columns"] = [
+                      {"name": name, "data_type": data_type, "nullable": nullable}
+                      for name, data_type, nullable in columns
+                  ]
+
+                  required = {
+                      "id", "user_message", "actual_intent",
+                      "reviewer_user_id", "reviewed_at",
+                  }
+                  missing = sorted(required - column_names)
+                  if missing:
+                      raise RuntimeError(
+                          "Required training table columns are missing: " + ", ".join(missing)
+                      )
+
+                  cursor.execute("""
+                      SELECT
+                          COUNT(*) AS total_rows,
+                          COUNT(*) FILTER (
+                              WHERE user_message IS NOT NULL
+                                AND BTRIM(user_message) <> ''
+                                AND actual_intent IS NOT NULL
+                                AND BTRIM(actual_intent) <> ''
+                          ) AS candidate_rows,
+                          COUNT(*) FILTER (
+                              WHERE user_message IS NOT NULL
+                                AND BTRIM(user_message) <> ''
+                                AND actual_intent IS NOT NULL
+                                AND BTRIM(actual_intent) <> ''
+                                AND reviewer_user_id IS NOT NULL
+                                AND reviewed_at IS NOT NULL
+                          ) AS audit_complete_candidates,
+                          COUNT(*) FILTER (
+                              WHERE user_message IS NOT NULL
+                                AND BTRIM(user_message) <> ''
+                                AND actual_intent IS NOT NULL
+                                AND BTRIM(actual_intent) <> ''
+                                AND (
+                                    reviewer_user_id IS NULL
+                                    OR reviewed_at IS NULL
+                                )
+                          ) AS audit_incomplete_candidates
+                      FROM public.assistant_training_logs
+                  """)
+                  total, candidates, audited, incomplete = cursor.fetchone()
+                  report.update({
+                      "total_table_rows": total,
+                      "candidate_rows_with_message_and_actual_intent": candidates,
+                      "candidate_rows_with_complete_review_audit": audited,
+                      "candidate_rows_with_incomplete_review_audit": incomplete,
+                  })
+
+                  cursor.execute("""
+                      SELECT
+                          BTRIM(actual_intent) AS actual_intent,
+                          COUNT(*) AS candidate_count,
+                          COUNT(*) FILTER (
+                              WHERE reviewer_user_id IS NOT NULL
+                                AND reviewed_at IS NOT NULL
+                          ) AS audit_complete_count
+                      FROM public.assistant_training_logs
+                      WHERE user_message IS NOT NULL
+                        AND BTRIM(user_message) <> ''
+                        AND actual_intent IS NOT NULL
+                        AND BTRIM(actual_intent) <> ''
+                      GROUP BY BTRIM(actual_intent)
+                      ORDER BY BTRIM(actual_intent)
+                  """)
+                  report["intent_audit_distribution"] = [
+                      {
+                          "actual_intent": intent,
+                          "candidate_count": candidate_count,
+                          "audit_complete_count": audit_count,
+                      }
+                      for intent, candidate_count, audit_count in cursor.fetchall()
+                  ]
+
+              connection.rollback()
+              report["preflight_status"] = "SUCCESS"
+          except Exception as error:
+              if connection:
+                  connection.rollback()
+              report["preflight_status"] = "FAILED"
+              report["error_type"] = type(error).__name__
+              with open("validation-artifacts/supabase_preflight.json", "w", encoding="utf-8") as handle:
+                  json.dump(report, handle, indent=2)
+              print("SUPABASE_PREFLIGHT=FAILED")
+              print(f"ERROR_TYPE={type(error).__name__}")
+              print("No row-level user messages or identifiers were intentionally selected.")
+              raise
+          finally:
+              if connection:
+                  connection.close()
+
+          with open("validation-artifacts/supabase_preflight.json", "w", encoding="utf-8") as handle:
+              json.dump(report, handle, indent=2)
+
+          print("SUPABASE_PREFLIGHT=SUCCESS")
+          print(f"TABLE_ROWS={report['total_table_rows']}")
+          print(f"CANDIDATE_ROWS={report['candidate_rows_with_message_and_actual_intent']}")
+          print(f"AUDIT_COMPLETE_CANDIDATES={report['candidate_rows_with_complete_review_audit']}")
+          print(f"AUDIT_INCOMPLETE_CANDIDATES={report['candidate_rows_with_incomplete_review_audit']}")
+          print("DATABASE_ACCESS=READ_ONLY")
+          print("No raw user messages or row-level identifiers were selected or printed.")
+          PY
+
+      - name: 🔒 Verify SQLAlchemy Training Connection Is Read-only
+        run: |
+          python - <<'PY'
+          import os
+          from sqlalchemy import create_engine, text
+
+          engine = create_engine(os.environ["DATABASE_URL"], pool_pre_ping=True)
+          try:
+              with engine.connect() as connection:
+                  mode = connection.execute(text("SHOW transaction_read_only")).scalar_one()
+                  print(f"SQLALCHEMY_TRANSACTION_READ_ONLY={mode}")
+                  if mode != "on":
+                      raise SystemExit("Training SQLAlchemy connection is not read-only.")
+          finally:
+              engine.dispose()
+          PY
+
+      - name: 🧪 Verify Training Script Uses Read-only SQL
+        shell: bash
+        run: |
+          python - <<'PY'
+          import ast
+          from pathlib import Path
+
+          source = Path("train.py").read_text(encoding="utf-8")
+          tree = ast.parse(source, filename="train.py")
+
+          forbidden = (
+              "INSERT", "UPDATE", "DELETE", "MERGE", "CREATE",
+              "ALTER", "DROP", "TRUNCATE", "GRANT", "REVOKE",
+          )
+          sql_literals = []
+          for node in ast.walk(tree):
+              if isinstance(node, ast.Constant) and isinstance(node.value, str):
+                  value = node.value.strip()
+                  if value and any(word in value.upper().split() for word in forbidden):
+                      raise SystemExit("Forbidden SQL/DML/DDL keyword detected in a string literal.")
+                  if value.upper().startswith(("SELECT", "WITH")):
+                      sql_literals.append(value)
+
+          if not sql_literals:
+              raise SystemExit("No read query found in train.py.")
+
+          if not any("FROM PUBLIC.ASSISTANT_TRAINING_LOGS" in query.upper() for query in sql_literals):
+              raise SystemExit("Expected training SELECT query was not found.")
+
+          print("TRAIN_SCRIPT_STATIC_GUARD=PASS")
+          print(f"READ_QUERY_COUNT={len(sql_literals)}")
+          PY
+
+      - name: 🚀 Run Feature-Branch Training (Read-only DB Session)
+        id: training
+        continue-on-error: true
+        run: |
+          set -o pipefail
+          python -u train.py 2>&1 | tee validation-artifacts/training_output.log
+
+      - name: 📋 Build Validation Summary
+        if: always()
+        shell: bash
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          report_path = Path("validation-artifacts/supabase_preflight.json")
+          report = json.loads(report_path.read_text(encoding="utf-8")) if report_path.exists() else {}
+
+          log_path = Path("validation-artifacts/training_output.log")
+          log = log_path.read_text(encoding="utf-8", errors="replace") if log_path.exists() else ""
+
+          def marker(name, default="N/A"):
+              prefix = name + "="
+              values = [line[len(prefix):].strip() for line in log.splitlines() if line.startswith(prefix)]
+              return values[-1] if values else default
+
+          report["training_status"] = marker("TRAINING_STATUS", "NOT_STARTED_OR_CRASHED")
+          report["training_rows_after_cleaning"] = marker("TRAINING_ROWS")
+          report["model_accuracy"] = marker("MODEL_ACCURACY")
+          report["model_saved"] = marker("MODEL_SAVED", "false")
+          report["model_path"] = marker("MODEL_PATH")
+          report["model_file_exists"] = Path("models/assistant_intent_model.pkl").is_file()
+          report["deployment"] = "NOT_CONFIGURED"
+          report["assistant_service_repository_write"] = "NOT_CONFIGURED"
+          report["database_mutations"] = "NOT_PERFORMED_BY_WORKFLOW"
+
+          Path("validation-artifacts/validation_summary.json").write_text(
+              json.dumps(report, indent=2),
+              encoding="utf-8",
+          )
+
+          print("VALIDATION_SUMMARY=WRITTEN")
+          print(f"TRAINING_STATUS={report['training_status']}")
+          print(f"MODEL_ACCURACY={report['model_accuracy']}")
+          print(f"MODEL_FILE_EXISTS={report['model_file_exists']}")
+          PY
+
+      - name: 📦 Upload Validation Report and Local Model Artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: assistant-ml-feature-validation-${{ github.run_id }}
+          path: |
+            validation-artifacts/
+            models/assistant_intent_model.pkl
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: 🚦 Final Validation Status
+        if: always()
+        shell: bash
+        run: |
+          if [ "${{ steps.preflight.outcome }}" != "success" ]; then
+            echo "::error::Supabase read-only preflight failed."
+            exit 1
+          fi
+
+          if [ "${{ steps.training.outcome }}" != "success" ]; then
+            echo "::error::Feature-branch training did not pass all data/model quality gates."
+            echo "Inspect the uploaded training log and validation summary artifact."
+            exit 1
+          fi
+
+          if [ ! -s "models/assistant_intent_model.pkl" ]; then
+            echo "::error::Training succeeded without a verified local model file."
+            exit 1
+          fi
+
+          echo "Feature-branch Supabase validation and local model training passed."
