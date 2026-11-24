@@ -13,8 +13,10 @@ on:
     branches:
       - main
     # Do not run production retraining for the isolated manual validation workflow.
+    # Keep workflow-only configuration changes from starting production retraining.
     paths-ignore:
       - '.github/workflows/manual-supabase-ml-validation.yml'
+      - '.github/workflows/retrain.yml'
 
   # Allow manual execution from GitHub Actions.
   workflow_dispatch:
