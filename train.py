@@ -29,7 +29,7 @@ from sklearn.metrics import accuracy_score, classification_report
 # user_message
 #
 # TARGET:
-# actual_intent when human-corrected, otherwise predicted_intent.
+# actual_intent from records with complete review audit metadata.
 #
 # MODEL:
 # TF-IDF + Logistic Regression
@@ -38,9 +38,9 @@ from sklearn.metrics import accuracy_score, classification_report
 # models/assistant_intent_model.pkl
 #
 # IMPORTANT:
-# Human-corrected actual_intent labels take priority.
-# When actual_intent is NULL or blank, predicted_intent
-# remains the fallback training label.
+# Only records with a populated actual_intent AND both
+# reviewer_user_id and reviewed_at are eligible for training.
+# predicted_intent is not used as a training-label fallback.
 #
 # ==========================================================
 
@@ -55,8 +55,8 @@ MINIMUM_ACCURACY = 0.70
 
 MINIMUM_EXAMPLES_PER_INTENT = 5
 
-# Only human-verified labels are eligible for supervised training.
-# Predicted intents are model outputs, not ground-truth labels.
+# Only audit-qualified actual_intent labels are eligible for training.
+# Complete audit metadata is required; predicted intents are not labels.
 
 MODEL_PATH = "models/assistant_intent_model.pkl"
 
@@ -195,25 +195,16 @@ finally:
 # STEP 4: FETCH TRAINING DATA
 # ==========================================================
 
-# Fetch both original and human-corrected intent labels.
-#
-# user_message:
-#   The original message entered by the user.
-#
-# predicted_intent:
-#   The intent assigned by the current Assistant system.
-#
-# actual_intent:
-#   Optional human-corrected intent. When populated, it
-#   takes priority as the model's training target.
-#
-# We exclude NULL and empty messages.
+# Fetch candidate messages, actual labels, and review audit metadata.
+# A record is eligible only when actual_intent, reviewer_user_id,
+# and reviewed_at are all populated. Empty messages are excluded.
 
 query = """
 SELECT
     user_message,
-    predicted_intent,
-    actual_intent
+    actual_intent,
+    reviewer_user_id,
+    reviewed_at
 FROM public.assistant_training_logs
 WHERE actual_intent IS NOT NULL
   AND TRIM(actual_intent) <> ''
@@ -262,55 +253,47 @@ print("-" * 40)
 # STEP 5: CLEAN TRAINING DATA
 # ==========================================================
 
-# Remove missing values.
-
+# Remove records missing required message or label values.
 df = df.dropna(
     subset=["user_message", "actual_intent"]
+).copy()
+
+# Normalize the message and target text.
+df["user_message"] = df["user_message"].astype(str).str.strip()
+df["actual_intent"] = df["actual_intent"].astype(str).str.strip()
+
+# Require BOTH audit fields. A populated actual_intent alone
+# is not sufficient evidence of a reviewed training example.
+audit_valid = (
+    df["reviewer_user_id"].notna()
+    & df["reviewed_at"].notna()
 )
+audit_rejected_rows = int((~audit_valid).sum())
 
-# Convert values to text.
+df = df[audit_valid].copy()
 
-df["user_message"] = df["user_message"].astype(str)
-
-# predicted_intent is retained only for diagnostics. It is never
-# used as a substitute for a human-verified training label.
-df["predicted_intent"] = df["predicted_intent"].fillna("").astype(str)
-
-df["actual_intent"] = df["actual_intent"].astype(str)
-
-# Remove leading and trailing spaces.
-
-df["user_message"] = df["user_message"].str.strip()
-
-df["predicted_intent"] = df["predicted_intent"].str.strip()
-
-df["actual_intent"] = df["actual_intent"].str.strip()
-
-# Remove empty messages and empty human-verified labels.
+# Exclude blank messages and labels after trimming.
 df = df[
-    (df["user_message"] != "") &
-    (df["actual_intent"] != "")
+    (df["user_message"] != "")
+    & (df["actual_intent"] != "")
 ].copy()
 
-# The target is exclusively the human-verified actual_intent.
+# The target is exclusively the audit-qualified actual_intent.
 df["training_intent"] = df["actual_intent"]
 
-# Remove duplicate message + effective training label combinations.
-#
-# The same message with DIFFERENT effective labels is retained
-# for investigation rather than silently discarded.
-
+# Remove exact duplicate message + intent combinations.
 df = df.drop_duplicates(
     subset=["user_message", "training_intent"]
 ).reset_index(drop=True)
 
 
-print("\n🧹 DATA CLEANING REPORT")
+print("\n🧹 DATA CLEANING AND AUDIT REPORT")
 print("-" * 40)
 
 training_rows = len(df)
 
-print(f"Valid unique human-verified rows: {training_rows}")
+print(f"Rows rejected for incomplete audit: {audit_rejected_rows}")
+print(f"Eligible unique audited rows: {training_rows}")
 
 print("-" * 40)
 
@@ -394,9 +377,7 @@ if train_record_count < number_of_intents:
 
 # X = User messages.
 #
-# y = Effective intent labels:
-#     actual_intent when human-corrected,
-#     otherwise predicted_intent.
+# y = actual_intent from records with complete review audit metadata.
 #
 # Example:
 #
@@ -411,11 +392,7 @@ X = df["user_message"]
 
 y = df["training_intent"]
 
-corrected_rows = (df["actual_intent"] != "").sum()
-fallback_rows = len(df) - corrected_rows
-
-print(f"Human-corrected labels used: {corrected_rows}")
-print(f"Predicted-label fallbacks : {fallback_rows}")
+print(f"Audit-qualified labels used: {len(df)}")
 print("\n✅ INPUT AND TARGET DATA PREPARED.")
 
 
