@@ -2,20 +2,12 @@ name: 🧠 Assistant ML Retraining + Dynamic Email Report
 
 on:
   # Daily at 5:30 AM IST (00:00 UTC).
+  # Scheduled retraining remains enabled.
   schedule:
     - cron: "0 0 * * *"
 
-  # Code changes that can affect training or its safeguards.
-  push:
-    branches:
-      - main
-    paths:
-      - "train.py"
-      - "intent_scope.py"
-      - "requirements.txt"
-      - "tests/**"
-      - ".github/workflows/retrain.yml"
-
+  # Initial training is started manually from Actions.
+  # No push-to-main trigger: merging code must not start training.
   workflow_dispatch:
 
 permissions:
