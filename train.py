@@ -27,6 +27,7 @@ from intent_scope import (
 
 
 TABLE_NAME = "public.assistant_training_logs"
+SOURCE_MODEL_VERSION = "rule_v4"
 MODEL_PATH = "models/assistant_intent_model.pkl"
 MINIMUM_RECORDS = (
     MINIMUM_UNIQUE_EXAMPLES_PER_INTENT * len(INITIAL_INTENTS)
@@ -88,6 +89,7 @@ def main():
     print("ASSISTANT ML — FIRST FIVE INTENTS")
     print("=" * 60)
     print("Allowed intents: " + ", ".join(INITIAL_INTENTS))
+    print(f"Source model version: {SOURCE_MODEL_VERSION}")
     print(
         "Minimum unique examples per intent: "
         f"{MINIMUM_UNIQUE_EXAMPLES_PER_INTENT}"
@@ -108,7 +110,8 @@ def main():
     query = text(f"""
         SELECT user_message, actual_intent
         FROM {TABLE_NAME}
-        WHERE actual_intent IS NOT NULL
+        WHERE model_version = :source_model_version
+          AND actual_intent IS NOT NULL
           AND BTRIM(actual_intent) <> ''
           AND user_message IS NOT NULL
           AND BTRIM(user_message) <> ''
@@ -121,7 +124,11 @@ def main():
         engine = create_read_only_engine(database_url)
         with engine.connect() as connection:
             connection.execute(text("SELECT 1"))
-        frame = pd.read_sql(query, engine)
+        frame = pd.read_sql(
+            query,
+            engine,
+            params={"source_model_version": SOURCE_MODEL_VERSION},
+        )
     except Exception as exc:
         stop_training(
             "Supabase read-only connection or data fetch failed: "
@@ -131,7 +138,7 @@ def main():
         if engine is not None:
             engine.dispose()
 
-    print(f"\nRows fetched for the five approved intents: {len(frame)}")
+    print(f"\nRows fetched for {SOURCE_MODEL_VERSION} five-intent records: {len(frame)}")
 
     try:
         data, report = prepare_training_data(frame)
