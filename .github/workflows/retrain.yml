@@ -1,401 +1,215 @@
-
 name: 🧠 Assistant ML Retraining + Dynamic Email Report
 
 on:
-
-  # Daily scheduled execution at 5:30 AM IST.
-  # GitHub Actions cron uses UTC.
+  # Daily at 5:30 AM IST (00:00 UTC).
   schedule:
-    - cron: '0 0 * * *'
+    - cron: "0 0 * * *"
 
-  # Run when code is pushed to main.
+  # Code changes that can affect training or its safeguards.
   push:
     branches:
       - main
-    # Do not run production retraining for the isolated manual validation workflow.
-    # Keep workflow-only configuration changes from starting production retraining.
-    paths-ignore:
-      - '.github/workflows/manual-supabase-ml-validation.yml'
-      - '.github/workflows/retrain.yml'
+    paths:
+      - "train.py"
+      - "intent_scope.py"
+      - "requirements.txt"
+      - "tests/**"
+      - ".github/workflows/retrain.yml"
 
-  # Allow manual execution from GitHub Actions.
   workflow_dispatch:
 
+permissions:
+  contents: read
+
+concurrency:
+  group: assistant-ml-retraining
+  cancel-in-progress: false
 
 jobs:
-
   retrain:
-
     runs-on: ubuntu-latest
+    timeout-minutes: 30
 
     steps:
-
-      # ==================================================
-      # STEP 1: CHECKOUT ML REPOSITORY
-      # ==================================================
-
       - name: 📥 Checkout ML Repository
         uses: actions/checkout@v4
 
-
-      # ==================================================
-      # STEP 2: SETUP PYTHON
-      # ==================================================
-
-      - name: 🐍 Setup Python
+      - name: 🐍 Setup Python 3.11
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
-
-
-      # ==================================================
-      # STEP 3: INSTALL DEPENDENCIES
-      # ==================================================
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: requirements.txt
 
       - name: 📦 Install Dependencies
         run: |
-
-          echo "Installing ML dependencies..."
-
           python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
 
-          pip install -r requirements.txt
+      - name: 🧪 Run Training Scope Tests
+        run: python -m unittest discover -s tests -v
 
-          echo "Dependencies installed successfully."
-
-
-      # ==================================================
-      # STEP 4: RUN MODEL TRAINING
-      # ==================================================
-
-      - name: 🚀 Train Assistant Model
-        id: train_step
-
-        # Continue to the reporting steps even if
-        # training returns a non-zero exit code.
-        continue-on-error: true
-
+      - name: 🔐 Validate Database Secret
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
-
         run: |
+          if [ -z "$DATABASE_URL" ]; then
+            echo "::error::DATABASE_URL secret is missing."
+            exit 1
+          fi
+          echo "DATABASE_URL is configured; its value is not printed."
 
-          echo "=========================================="
-          echo "🚀 STARTING ASSISTANT MODEL TRAINING"
-          echo "=========================================="
-
+      - name: 🚀 Train Five-Intent Assistant Model
+        id: train_step
+        continue-on-error: true
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          PYTHONUNBUFFERED: "1"
+        shell: bash
+        run: |
           set -o pipefail
-
           python -u train.py 2>&1 | tee training_output.log
-
-          echo "=========================================="
-
-
-      # ==================================================
-      # STEP 5: EXTRACT TRAINING METRICS
-      # ==================================================
 
       - name: 📊 Extract Training Metrics
         id: metrics
         if: always()
-
+        shell: bash
         run: |
-
           ROWS=$(grep '^TRAINING_ROWS=' training_output.log 2>/dev/null | tail -1 | cut -d '=' -f2 || true)
-
           ACCURACY=$(grep '^MODEL_ACCURACY=' training_output.log 2>/dev/null | tail -1 | cut -d '=' -f2 || true)
+          STATUS=$(grep '^TRAINING_STATUS=' training_output.log 2>/dev/null | tail -1 | cut -d '=' -f2 || true)
+          SAVED=$(grep '^MODEL_SAVED=' training_output.log 2>/dev/null | tail -1 | cut -d '=' -f2 || true)
 
-          TRAINING_STATUS=$(grep '^TRAINING_STATUS=' training_output.log 2>/dev/null | tail -1 | cut -d '=' -f2 || true)
+          echo "rows=${ROWS:-N/A}" >> "$GITHUB_OUTPUT"
+          echo "accuracy=${ACCURACY:-N/A}" >> "$GITHUB_OUTPUT"
+          echo "training_status=${STATUS:-FAILED}" >> "$GITHUB_OUTPUT"
+          echo "model_saved=${SAVED:-false}" >> "$GITHUB_OUTPUT"
 
-          MODEL_SAVED=$(grep '^MODEL_SAVED=' training_output.log 2>/dev/null | tail -1 | cut -d '=' -f2 || true)
-
-          if [ -z "$ROWS" ]; then
-            ROWS="N/A"
-          fi
-
-          if [ -z "$ACCURACY" ]; then
-            ACCURACY="N/A"
-          fi
-
-          if [ -z "$TRAINING_STATUS" ]; then
-            TRAINING_STATUS="FAILED"
-          fi
-
-          if [ -z "$MODEL_SAVED" ]; then
-            MODEL_SAVED="false"
-          fi
-
-          echo "rows=$ROWS" >> "$GITHUB_OUTPUT"
-
-          echo "accuracy=$ACCURACY" >> "$GITHUB_OUTPUT"
-
-          echo "training_status=$TRAINING_STATUS" >> "$GITHUB_OUTPUT"
-
-          echo "model_saved=$MODEL_SAVED" >> "$GITHUB_OUTPUT"
-
-          echo "Training status: $TRAINING_STATUS"
-
-          echo "Training rows: $ROWS"
-
-          echo "Accuracy: $ACCURACY"
-
-          echo "Model saved: $MODEL_SAVED"
-
-
-      # ==================================================
-      # STEP 6: CHECK NEWLY TRAINED MODEL
-      # ==================================================
-
-      - name: 🔎 Verify New Model File
+      - name: 🔎 Verify Newly Trained Model
         id: check_model
         if: always()
-
+        shell: bash
         run: |
-
           if [ "${{ steps.train_step.outcome }}" = "success" ] && \
              [ "${{ steps.metrics.outputs.model_saved }}" = "true" ] && \
              [ -s "models/assistant_intent_model.pkl" ]; then
-
             echo "model_exists=true" >> "$GITHUB_OUTPUT"
-
-            echo "New trained model verified."
-
+            echo "Five-intent model artifact verified."
           else
-
             echo "model_exists=false" >> "$GITHUB_OUTPUT"
-
-            echo "No newly trained model available for deployment."
-
+            echo "No validated model artifact is available."
           fi
 
-
-      # ==================================================
-      # STEP 7: DEPLOY MODEL TO ASSISTANT SERVICE
-      # ==================================================
-
-      - name: 📤 Push New Model to Assistant Service
+      - name: 📤 Create Assistant-Service Model Update Pull Request
         id: deploy_step
-
         if: steps.check_model.outputs.model_exists == 'true'
-
         env:
           TOKEN: ${{ secrets.ASSISTANT_REPO_TOKEN }}
           REPO: ${{ secrets.ASSISTANT_REPO_NAME }}
-
+        shell: bash
         run: |
-
-          echo "Cloning Assistant Service repository..."
+          set -euo pipefail
 
           if [ -z "$TOKEN" ] || [ -z "$REPO" ]; then
-
-            echo "Repository token or repository name is missing."
-
+            echo "::error::ASSISTANT_REPO_TOKEN or ASSISTANT_REPO_NAME is missing."
             exit 1
-
           fi
 
-          git clone \
-            "https://x-access-token:${TOKEN}@github.com/${REPO}.git" \
-            target_repo
+          BRANCH="ml-model/five-intent-${GITHUB_RUN_ID}"
 
-          mkdir -p target_repo/models
-
-          cp models/assistant_intent_model.pkl \
-            target_repo/models/assistant_intent_model.pkl
-
+          git clone "https://x-access-token:${TOKEN}@github.com/${REPO}.git" target_repo
           cd target_repo
+          git checkout -b "$BRANCH"
+
+          mkdir -p models
+          cp "../models/assistant_intent_model.pkl" models/assistant_intent_model.pkl
 
           git config user.name "Assistant ML Bot"
-
           git config user.email "ml-bot@example.com"
-
           git add models/assistant_intent_model.pkl
 
           if git diff --cached --quiet; then
-
-            echo "Model content is unchanged."
-
             echo "deployment_status=no_changes" >> "$GITHUB_OUTPUT"
-
-          else
-
-            git commit -m "Update Assistant intent model"
-
-            git push origin HEAD
-
-            echo "deployment_status=pushed" >> "$GITHUB_OUTPUT"
-
-            echo "New model pushed successfully."
-
+            echo "The validated model is identical to the current Assistant-Service artifact."
+            exit 0
           fi
 
+          git commit -m "Update validated five-intent assistant model"
+          git push --set-upstream origin "$BRANCH"
 
-      # ==================================================
-      # STEP 8: GENERATE EXECUTION DATE
-      # ==================================================
+          export GH_TOKEN="$TOKEN"
+          PR_URL=$(gh pr create \
+            --repo "$REPO" \
+            --base main \
+            --head "$BRANCH" \
+            --title "Update validated five-intent assistant model" \
+            --body "Automated model artifact update from assistant-ml-pipeline.
+
+          - Scope: add_to_cart, view_cart, show_orders, track_order, cancel_order
+          - Training run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          - The model passed the configured data-quality and evaluation gates.
+          - This pull request requires review before it can reach main or production.")
+
+          echo "deployment_status=pull_request_created" >> "$GITHUB_OUTPUT"
+          echo "pull_request_url=$PR_URL" >> "$GITHUB_OUTPUT"
+          echo "Created model update PR: $PR_URL"
 
       - name: 📅 Generate Execution Date
         id: date_step
         if: always()
-
         run: |
-
-          TODAY=$(TZ=Asia/Kolkata date +"%d-%m-%Y %I:%M:%S %p IST")
-
-          echo "today_date=$TODAY" >> "$GITHUB_OUTPUT"
-
-
-      # ==================================================
-      # STEP 9: SEND EMAIL REPORT
-      # ==================================================
-
-      # IMPORTANT:
-      # This step is attempted whether training succeeds
-      # or fails, because it uses if: always().
+          echo "today_date=$(TZ=Asia/Kolkata date +'%d-%m-%Y %I:%M:%S %p IST')" >> "$GITHUB_OUTPUT"
 
       - name: 📧 Send Assistant ML Email Report
-        id: email_step
         if: always()
-
         uses: dawidd6/action-send-mail@v3
-
         with:
-
           server_address: smtp.gmail.com
-
           server_port: 465
-
           username: ${{ secrets.MAIL_USERNAME }}
-
           password: ${{ secrets.MAIL_PASSWORD }}
-
           secure: true
-
           from: Assistant ML Bot
-
           to: ${{ secrets.MAIL_TO }}
-
           cc: ${{ secrets.MAIL_CC }}
-
           subject: "Assistant ML Report - ${{ steps.date_step.outputs.today_date }}"
-
           html_body: |
-
-            <h2>🧠 Assistant ML Training Report</h2>
-
-            <p>Automated Assistant ML pipeline execution report.</p>
-
+            <h2>Assistant ML Training Report</h2>
             <table border="1" cellpadding="8" cellspacing="0">
-
-              <tr>
-                <th align="left">Execution Date</th>
-                <td>${{ steps.date_step.outputs.today_date }}</td>
-              </tr>
-
-              <tr>
-                <th align="left">Repository</th>
-                <td>${{ github.repository }}</td>
-              </tr>
-
-              <tr>
-                <th align="left">Training Step Result</th>
-                <td>${{ steps.train_step.outcome }}</td>
-              </tr>
-
-              <tr>
-                <th align="left">Training Status</th>
-                <td>${{ steps.metrics.outputs.training_status }}</td>
-              </tr>
-
-              <tr>
-                <th align="left">Training Records</th>
-                <td>${{ steps.metrics.outputs.rows }}</td>
-              </tr>
-
-              <tr>
-                <th align="left">Model Accuracy</th>
-                <td>${{ steps.metrics.outputs.accuracy }}</td>
-              </tr>
-
-              <tr>
-                <th align="left">Model Saved</th>
-                <td>${{ steps.check_model.outputs.model_exists }}</td>
-              </tr>
-
-              <tr>
-                <th align="left">Model Deployment Result</th>
-                <td>${{ steps.deploy_step.outputs.deployment_status || 'NOT DEPLOYED' }}</td>
-              </tr>
-
-              <tr>
-                <th align="left">Runtime Model Loaded</th>
-                <td>NOT VERIFIED - Check Render deployment logs</td>
-              </tr>
-
+              <tr><th align="left">Execution Date</th><td>${{ steps.date_step.outputs.today_date }}</td></tr>
+              <tr><th align="left">Repository</th><td>${{ github.repository }}</td></tr>
+              <tr><th align="left">Training Step</th><td>${{ steps.train_step.outcome }}</td></tr>
+              <tr><th align="left">Training Status</th><td>${{ steps.metrics.outputs.training_status }}</td></tr>
+              <tr><th align="left">Unique Training Rows</th><td>${{ steps.metrics.outputs.rows }}</td></tr>
+              <tr><th align="left">Accuracy</th><td>${{ steps.metrics.outputs.accuracy }}</td></tr>
+              <tr><th align="left">Model Artifact Verified</th><td>${{ steps.check_model.outputs.model_exists }}</td></tr>
+              <tr><th align="left">Assistant-Service Update</th><td>${{ steps.deploy_step.outputs.deployment_status || 'NOT CREATED' }}</td></tr>
+              <tr><th align="left">Pull Request</th><td>${{ steps.deploy_step.outputs.pull_request_url || 'N/A' }}</td></tr>
             </table>
-
-            <br>
-
-            <h3>Execution Details</h3>
-
-            <p>
-              Training is considered successful only when the
-              model passes validation and is saved.
-            </p>
-
-            <p>
-              A model deployment result of "pushed" means the
-              new model was pushed to the Assistant Service
-              GitHub repository. It does not independently
-              confirm that Render loaded the model.
-            </p>
-
-            <p>
-              If training fails or data is insufficient,
-              the existing production model is not replaced
-              by this workflow.
-            </p>
-
-            <br>
-
-            <p>
-              <b>View Full GitHub Actions Logs:</b><br>
-
-              <a href="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}">
-                Open Workflow Execution
-              </a>
-            </p>
-
-            <p>🚀 Assistant ML Automation</p>
-
-
-      # ==================================================
-      # STEP 10: FINAL WORKFLOW STATUS
-      # ==================================================
-
-      # Training failures are reported by email first.
-      # Then this step makes the overall workflow fail,
-      # so GitHub does not incorrectly show success.
+            <p>Only human-reviewed actual_intent labels from the five approved intents are eligible.</p>
+            <p>Insufficient data or a quality rejection is an expected skipped training run. The existing model is not replaced.</p>
+            <p>A pull request is not a production deployment. Review and merge are required before Assistant-Service main changes.</p>
+            <p><a href="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}">Open workflow run</a></p>
 
       - name: 🚦 Final Training Status
         if: always()
-
+        shell: bash
         run: |
+          STATUS="${{ steps.metrics.outputs.training_status }}"
 
-          if [ "${{ steps.train_step.outcome }}" != "success" ]; then
+          if [ "$STATUS" = "INSUFFICIENT_DATA" ] || [ "$STATUS" = "QUALITY_REJECTED" ]; then
+            echo "Training was safely skipped by a data/quality gate. Existing model remains unchanged."
+            exit 0
+          fi
 
-            echo "❌ Assistant ML training did not complete successfully."
-
+          if [ "${{ steps.train_step.outcome }}" != "success" ] || [ "$STATUS" != "TRAINED" ]; then
+            echo "::error::Training execution failed. Inspect the training log."
             exit 1
-
           fi
 
           if [ "${{ steps.check_model.outputs.model_exists }}" != "true" ]; then
-
-            echo "❌ No newly trained model was verified."
-
+            echo "::error::Training reported success but no verified model artifact exists."
             exit 1
-
           fi
 
-          echo "✅ Assistant ML training completed successfully."
+          echo "Five-intent model trained and artifact verified."
