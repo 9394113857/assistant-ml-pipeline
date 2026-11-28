@@ -26,6 +26,7 @@ from intent_scope import (
 )
 
 
+# Training reads reviewed examples from this source; keep source records unchanged.
 TABLE_NAME = "public.assistant_training_logs"
 SOURCE_MODEL_VERSION = "rule_v4"
 MODEL_PATH = "models/assistant_intent_model.pkl"
