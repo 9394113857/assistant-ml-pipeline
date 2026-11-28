@@ -74,6 +74,11 @@ jobs:
       contents: read
       pull-requests: write
     steps:
+      - name: 📥 Checkout Repository for GitHub CLI
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+
       - name: 🤖 Enable Squash Auto-Merge
         env:
           GH_TOKEN: ${{ github.token }}
