@@ -1,30 +1,84 @@
+
 name: 🧠 Assistant ML Retraining + Dynamic Email Report
 
+# ============================================================
+# WORKFLOW TRIGGERS
+# ============================================================
+# Three triggers are enabled:
+# 1. Scheduled: Daily at 5:30 AM IST (00:00 UTC).
+# 2. Manual: Run workflow from GitHub Actions.
+# 3. Push: Automatically run when commits are pushed or
+#    merged into the main branch.
+# ============================================================
+
 on:
-  # Daily at 5:30 AM IST (00:00 UTC).
-  # Scheduled retraining remains enabled.
+
+  # Daily scheduled retraining at 5:30 AM IST.
   schedule:
     - cron: "0 0 * * *"
 
-  # Initial training is started manually from Actions.
-  # No push-to-main trigger: merging code must not start training.
+  # Manual training from GitHub Actions -> Run workflow.
   workflow_dispatch:
+
+  # Automatically train when commits reach main.
+  push:
+    branches:
+      - main
+
+
+# ============================================================
+# WORKFLOW PERMISSIONS
+# ============================================================
+# Read access to the ML repository.
+# Cross-repository operations use ASSISTANT_REPO_TOKEN.
+# ============================================================
 
 permissions:
   contents: read
+
+
+# ============================================================
+# CONCURRENCY CONTROL
+# ============================================================
+# Prevents simultaneous execution within this workflow group.
+# Active runs are not cancelled when another trigger occurs.
+# ============================================================
 
 concurrency:
   group: assistant-ml-retraining
   cancel-in-progress: false
 
+
+# ============================================================
+# JOB: ASSISTANT ML RETRAINING
+# ============================================================
+
 jobs:
+
   retrain:
+
     runs-on: ubuntu-latest
     timeout-minutes: 30
 
     steps:
+
+      # ======================================================
+      # STEP 1: CHECKOUT ML REPOSITORY
+      # ======================================================
+      # Downloads repository source code.
+      # Makes training scripts, tests and model files available.
+      # ======================================================
+
       - name: 📥 Checkout ML Repository
         uses: actions/checkout@v4
+
+
+      # ======================================================
+      # STEP 2: SETUP PYTHON 3.11
+      # ======================================================
+      # Configures Python 3.11.
+      # Enables pip caching to reduce installation time.
+      # ======================================================
 
       - name: 🐍 Setup Python 3.11
         uses: actions/setup-python@v5
@@ -33,13 +87,36 @@ jobs:
           cache: pip
           cache-dependency-path: requirements.txt
 
+
+      # ======================================================
+      # STEP 3: INSTALL DEPENDENCIES
+      # ======================================================
+      # Installs all dependencies from requirements.txt.
+      # ======================================================
+
       - name: 📦 Install Dependencies
         run: |
           python -m pip install --upgrade pip
           python -m pip install -r requirements.txt
 
+
+      # ======================================================
+      # STEP 4: RUN TRAINING SCOPE TESTS
+      # ======================================================
+      # Executes the unittest test suite.
+      # Training does not proceed if tests fail.
+      # ======================================================
+
       - name: 🧪 Run Training Scope Tests
         run: python -m unittest discover -s tests -v
+
+
+      # ======================================================
+      # STEP 5: VALIDATE DATABASE SECRET
+      # ======================================================
+      # Checks DATABASE_URL without printing its value.
+      # Required secret: DATABASE_URL
+      # ======================================================
 
       - name: 🔐 Validate Database Secret
         env:
@@ -51,6 +128,23 @@ jobs:
           fi
           echo "DATABASE_URL is configured; its value is not printed."
 
+
+      # ======================================================
+      # STEP 6: TRAIN FIVE-INTENT ASSISTANT MODEL
+      # ======================================================
+      # Executes train.py.
+      #
+      # Approved intents:
+      # add_to_cart
+      # view_cart
+      # show_orders
+      # track_order
+      # cancel_order
+      #
+      # Saves console output to training_output.log.
+      # Training failures are evaluated in the final step.
+      # ======================================================
+
       - name: 🚀 Train Five-Intent Assistant Model
         id: train_step
         continue-on-error: true
@@ -61,6 +155,19 @@ jobs:
         run: |
           set -o pipefail
           python -u train.py 2>&1 | tee training_output.log
+
+
+      # ======================================================
+      # STEP 7: EXTRACT TRAINING METRICS
+      # ======================================================
+      # Extracts:
+      # TRAINING_ROWS
+      # MODEL_ACCURACY
+      # TRAINING_STATUS
+      # MODEL_SAVED
+      #
+      # Runs even if training fails.
+      # ======================================================
 
       - name: 📊 Extract Training Metrics
         id: metrics
@@ -77,6 +184,19 @@ jobs:
           echo "training_status=${STATUS:-FAILED}" >> "$GITHUB_OUTPUT"
           echo "model_saved=${SAVED:-false}" >> "$GITHUB_OUTPUT"
 
+
+      # ======================================================
+      # STEP 8: VERIFY NEWLY TRAINED MODEL
+      # ======================================================
+      # Requires:
+      # 1. Successful training.
+      # 2. MODEL_SAVED=true.
+      # 3. Non-empty model artifact.
+      #
+      # Expected artifact:
+      # models/assistant_intent_model.pkl
+      # ======================================================
+
       - name: 🔎 Verify Newly Trained Model
         id: check_model
         if: always()
@@ -91,6 +211,23 @@ jobs:
             echo "model_exists=false" >> "$GITHUB_OUTPUT"
             echo "No validated model artifact is available."
           fi
+
+
+      # ======================================================
+      # STEP 9: CREATE ASSISTANT-SERVICE MODEL UPDATE PR
+      # ======================================================
+      # Runs only when the model artifact is verified.
+      #
+      # Clones Assistant-Service, creates a unique branch,
+      # copies the model, commits, pushes and creates a PR.
+      #
+      # Required secrets:
+      # ASSISTANT_REPO_TOKEN
+      # ASSISTANT_REPO_NAME
+      #
+      # PR requires human review and merge.
+      # This is not an automatic production deployment.
+      # ======================================================
 
       - name: 📤 Create Assistant-Service Model Update Pull Request
         id: deploy_step
@@ -110,14 +247,18 @@ jobs:
           BRANCH="ml-model/five-intent-${GITHUB_RUN_ID}"
 
           git clone "https://x-access-token:${TOKEN}@github.com/${REPO}.git" target_repo
+
           cd target_repo
+
           git checkout -b "$BRANCH"
 
           mkdir -p models
+
           cp "../models/assistant_intent_model.pkl" models/assistant_intent_model.pkl
 
           git config user.name "Assistant ML Bot"
           git config user.email "ml-bot@example.com"
+
           git add models/assistant_intent_model.pkl
 
           if git diff --cached --quiet; then
@@ -127,9 +268,11 @@ jobs:
           fi
 
           git commit -m "Update validated five-intent assistant model"
+
           git push --set-upstream origin "$BRANCH"
 
           export GH_TOKEN="$TOKEN"
+
           PR_URL=$(gh pr create \
             --repo "$REPO" \
             --base main \
@@ -146,11 +289,36 @@ jobs:
           echo "pull_request_url=$PR_URL" >> "$GITHUB_OUTPUT"
           echo "Created model update PR: $PR_URL"
 
+
+      # ======================================================
+      # STEP 10: GENERATE EXECUTION DATE
+      # ======================================================
+      # Generates execution date and time in IST.
+      # Used in the dynamic email subject and report.
+      # ======================================================
+
       - name: 📅 Generate Execution Date
         id: date_step
         if: always()
         run: |
           echo "today_date=$(TZ=Asia/Kolkata date +'%d-%m-%Y %I:%M:%S %p IST')" >> "$GITHUB_OUTPUT"
+
+
+      # ======================================================
+      # STEP 11: SEND DYNAMIC ASSISTANT ML EMAIL REPORT
+      # ======================================================
+      # Sends an HTML report containing execution date,
+      # training status, rows, accuracy, artifact verification,
+      # Assistant-Service update status and pull request URL.
+      #
+      # Required secrets:
+      # MAIL_USERNAME
+      # MAIL_PASSWORD
+      # MAIL_TO
+      # MAIL_CC
+      #
+      # Email failure does not overwrite training results.
+      # ======================================================
 
       - name: 📧 Send Assistant ML Email Report
         if: always()
@@ -168,21 +336,83 @@ jobs:
           subject: "Assistant ML Report - ${{ steps.date_step.outputs.today_date }}"
           html_body: |
             <h2>Assistant ML Training Report</h2>
+
             <table border="1" cellpadding="8" cellspacing="0">
-              <tr><th align="left">Execution Date</th><td>${{ steps.date_step.outputs.today_date }}</td></tr>
-              <tr><th align="left">Repository</th><td>${{ github.repository }}</td></tr>
-              <tr><th align="left">Training Step</th><td>${{ steps.train_step.outcome }}</td></tr>
-              <tr><th align="left">Training Status</th><td>${{ steps.metrics.outputs.training_status }}</td></tr>
-              <tr><th align="left">Unique Training Rows</th><td>${{ steps.metrics.outputs.rows }}</td></tr>
-              <tr><th align="left">Accuracy</th><td>${{ steps.metrics.outputs.accuracy }}</td></tr>
-              <tr><th align="left">Model Artifact Verified</th><td>${{ steps.check_model.outputs.model_exists }}</td></tr>
-              <tr><th align="left">Assistant-Service Update</th><td>${{ steps.deploy_step.outputs.deployment_status || 'NOT CREATED' }}</td></tr>
-              <tr><th align="left">Pull Request</th><td>${{ steps.deploy_step.outputs.pull_request_url || 'N/A' }}</td></tr>
+
+              <tr>
+                <th align="left">Execution Date</th>
+                <td>${{ steps.date_step.outputs.today_date }}</td>
+              </tr>
+
+              <tr>
+                <th align="left">Repository</th>
+                <td>${{ github.repository }}</td>
+              </tr>
+
+              <tr>
+                <th align="left">Training Step</th>
+                <td>${{ steps.train_step.outcome }}</td>
+              </tr>
+
+              <tr>
+                <th align="left">Training Status</th>
+                <td>${{ steps.metrics.outputs.training_status }}</td>
+              </tr>
+
+              <tr>
+                <th align="left">Unique Training Rows</th>
+                <td>${{ steps.metrics.outputs.rows }}</td>
+              </tr>
+
+              <tr>
+                <th align="left">Accuracy</th>
+                <td>${{ steps.metrics.outputs.accuracy }}</td>
+              </tr>
+
+              <tr>
+                <th align="left">Model Artifact Verified</th>
+                <td>${{ steps.check_model.outputs.model_exists }}</td>
+              </tr>
+
+              <tr>
+                <th align="left">Assistant-Service Update</th>
+                <td>${{ steps.deploy_step.outputs.deployment_status || 'NOT CREATED' }}</td>
+              </tr>
+
+              <tr>
+                <th align="left">Pull Request</th>
+                <td>${{ steps.deploy_step.outputs.pull_request_url || 'N/A' }}</td>
+              </tr>
+
             </table>
+
             <p>Only human-reviewed actual_intent labels from the five approved intents are eligible.</p>
+
             <p>Insufficient data or a quality rejection is an expected skipped training run. The existing model is not replaced.</p>
+
             <p>A pull request is not a production deployment. Review and merge are required before Assistant-Service main changes.</p>
-            <p><a href="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}">Open workflow run</a></p>
+
+            <p>
+              <a href="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}">
+                Open workflow run
+              </a>
+            </p>
+
+
+      # ======================================================
+      # STEP 12: FINAL TRAINING STATUS
+      # ======================================================
+      # INSUFFICIENT_DATA:
+      # Safely skipped; existing model remains unchanged.
+      #
+      # QUALITY_REJECTED:
+      # Safely rejected; existing model remains unchanged.
+      #
+      # TRAINED:
+      # Requires successful training and verified artifact.
+      #
+      # Any other failure marks the job as failed.
+      # ======================================================
 
       - name: 🚦 Final Training Status
         if: always()
