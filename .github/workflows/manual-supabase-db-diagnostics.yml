@@ -30,10 +30,10 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: 📦 Install PostgreSQL Driver
+      - name: 📦 Install Pipeline Dependencies
         run: |
           python -m pip install --upgrade pip
-          python -m pip install "psycopg2-binary==2.9.11"
+          python -m pip install -r requirements.txt
 
       - name: 🔐 Validate Database Configuration
         shell: bash
@@ -258,6 +258,72 @@ jobs:
           finally:
               if connection:
                   connection.close()
+          PY
+
+      - name: 🧪 Validate Training SQLAlchemy Read-only Engine
+        run: |
+          python - <<'PY'
+          import os
+          import sys
+
+          import pandas as pd
+          from sqlalchemy import text
+
+          from train import create_read_only_engine
+
+          engine = None
+          try:
+              engine = create_read_only_engine(os.environ["DATABASE_URL"])
+
+              # Match the training code's SQLAlchemy + pandas read path.
+              # Never print message text, labels, user IDs, or other row data.
+              query = text("""
+                  SELECT user_message, actual_intent
+                  FROM public.assistant_training_logs
+                  WHERE model_version = :model_version
+                    AND actual_intent IS NOT NULL
+                    AND BTRIM(actual_intent) <> ''
+                    AND user_message IS NOT NULL
+                    AND BTRIM(user_message) <> ''
+                  ORDER BY id ASC
+                  LIMIT 1
+              """)
+
+              with engine.connect() as connection:
+                  select_one = connection.execute(text("SELECT 1")).scalar_one()
+                  read_only_mode = connection.execute(
+                      text("SHOW transaction_read_only")
+                  ).scalar_one()
+
+              if select_one != 1:
+                  raise RuntimeError("SQLAlchemy SELECT 1 validation failed.")
+              if read_only_mode != "on":
+                  raise RuntimeError(
+                      "SQLAlchemy transaction_read_only was not confirmed as on."
+                  )
+
+              sample = pd.read_sql(
+                  query,
+                  engine,
+                  params={"model_version": "rule_v4"},
+              )
+
+              print("SQLALCHEMY_READ_ONLY_STATUS=SUCCESS")
+              print("SQLALCHEMY_SELECT_1=SUCCESS")
+              print(f"TRANSACTION_READ_ONLY={read_only_mode}")
+              print(f"TRAINING_QUERY_EXECUTION=SUCCESS")
+              print(f"TRAINING_QUERY_SAMPLE_ROWS={len(sample)}")
+              print("No row contents or user identifiers were printed.")
+              print("No INSERT, UPDATE, DELETE, DDL, or migration commands were executed.")
+
+          except Exception as error:
+              print("SQLALCHEMY_READ_ONLY_STATUS=FAILED")
+              print(f"ERROR_TYPE={type(error).__name__}")
+              print(f"ERROR_MESSAGE={error}")
+              sys.exit(1)
+          finally:
+              if engine is not None:
+                  engine.dispose()
           PY
 
       - name: 📋 Diagnostics Summary
