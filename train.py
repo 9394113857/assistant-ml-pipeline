@@ -55,29 +55,28 @@ def stop_training(message, status="FAILED"):
     sys.exit(0 if status in NON_ERROR_STATUSES else 1)
 
 
-def create_read_only_engine(database_url):
-    """Create a PostgreSQL engine that cannot write to Supabase."""
-    engine = create_engine(
-        database_url,
-        pool_pre_ping=True,
-        connect_args={
-            "options": "-c default_transaction_read_only=on"
-        },
-    )
+def enforce_read_only_transaction(connection):
+    """Make the current transaction read-only and verify PostgreSQL enforced it."""
+    # SET TRANSACTION is the first SQL statement in each SQLAlchemy transaction.
+    # Unlike a startup 'options' parameter, this works with Supabase poolers
+    # that may ignore or reject PostgreSQL startup options.
+    connection.exec_driver_sql("SET TRANSACTION READ ONLY")
+    mode = connection.exec_driver_sql(
+        "SHOW transaction_read_only"
+    ).scalar_one()
+    if mode != "on":
+        raise RuntimeError(
+            "PostgreSQL did not confirm a read-only transaction."
+        )
 
-    @event.listens_for(engine, "connect")
-    def verify_read_only_connection(dbapi_connection, connection_record):
-        cursor = dbapi_connection.cursor()
-        try:
-            cursor.execute("SHOW transaction_read_only")
-            mode = cursor.fetchone()[0]
-            if mode != "on":
-                raise RuntimeError(
-                    "PostgreSQL did not confirm a read-only connection."
-                )
-        finally:
-            cursor.close()
-            dbapi_connection.rollback()
+
+def create_read_only_engine(database_url):
+    """Create an engine that enforces read-only mode for every transaction."""
+    engine = create_engine(database_url, pool_pre_ping=True)
+
+    @event.listens_for(engine, "begin")
+    def set_read_only_for_transaction(connection):
+        enforce_read_only_transaction(connection)
 
     return engine
 
